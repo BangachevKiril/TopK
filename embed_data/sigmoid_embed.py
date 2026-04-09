@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
-Train SigLIP-style embeddings on a pre-generated bipartite graph saved as a .npy file.
+Train SigLIP-style embeddings on a random bipartite graph with distinct k-neighborhoods.
 
-The input graph file should contain a dense adjacency matrix A of shape (N, n)
-with entries in {0,1}. Each row is expected to have exactly k ones.
-
-This script saves checkpoints as .npz files.
+This version:
+  - loads sparse graph files saved as scipy .npz,
+  - keeps the graph in compact neighborhood form in memory,
+  - falls back to legacy dense .npy graph files when needed,
+  - recursively-friendly: graph_path may live anywhere,
+  - saves checkpoints as compressed .npz files,
+  - tracks margin, defined as gap / 2.
 """
 
 from __future__ import annotations
@@ -14,21 +17,24 @@ import argparse
 import json
 import math
 import random
+import sys
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 import numpy as np
+import scipy.sparse as sp
 import torch
 import torch.nn.functional as F
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--graph_path", type=str, required=True)
+    parser.add_argument("--graph_path", type=str, default=None)
     parser.add_argument("--n", type=int, required=True)
     parser.add_argument("--d", type=int, required=True)
     parser.add_argument("--k", type=int, required=True)
-    parser.add_argument("--N", type=int, required=True)
+    parser.add_argument("--p", type=float, default=None)
+    parser.add_argument("--N", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--initialization", type=str, default="random", choices=["random", "spectral"])
     parser.add_argument("--num_steps", type=int, required=True)
@@ -58,46 +64,108 @@ def resolve_device(device_arg: Optional[str]) -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def validate_inputs(n: int, d: int, k: int, N: int, batch_size: Optional[int]) -> int:
+def validate_and_resolve_sizes(
+    n: int,
+    d: int,
+    k: int,
+    p: Optional[float],
+    N: Optional[int],
+    batch_size: Optional[int],
+) -> Tuple[int, int]:
     if n <= 0:
         raise ValueError(f"n must be positive, got {n}.")
     if d <= 0:
         raise ValueError(f"d must be positive, got {d}.")
-    if not (0 < k <= n):
-        raise ValueError(f"k must satisfy 1 <= k <= n, got k={k}, n={n}.")
-    if N <= 0:
-        raise ValueError(f"N must be positive, got {N}.")
+    if not (0 <= k <= n):
+        raise ValueError(f"k must satisfy 0 <= k <= n, got k={k}, n={n}.")
 
     total_combinations = math.comb(n, k)
+    if total_combinations <= 0:
+        raise ValueError("binom(n, k) must be positive.")
+
+    if N is None:
+        if p is None:
+            raise ValueError("You must provide p when N is None.")
+        if p <= 0:
+            raise ValueError(f"p must be positive, got {p}.")
+        N = math.floor(p * total_combinations)
+
+    if N <= 0:
+        raise ValueError(f"Resolved N must be positive, got {N}.")
     if N > total_combinations:
         raise ValueError(
-            f"Cannot have N={N} distinct k-neighborhoods because binom(n, k)={total_combinations}."
+            f"Cannot choose N={N} distinct k-neighborhoods because binom(n, k)={total_combinations}."
         )
 
     if batch_size is None:
         batch_size = n
     if not (1 <= batch_size <= n):
         raise ValueError(f"batch_size must satisfy 1 <= batch_size <= n, got {batch_size}.")
-    return batch_size
+
+    return N, batch_size
 
 
-def load_graph(graph_path: str, expected_N: int, expected_n: int, expected_k: int) -> torch.Tensor:
-    path = Path(graph_path)
-    if not path.is_file():
-        raise FileNotFoundError(f"Graph file not found: {path}")
+def sample_unique_ranks(total: int, num_samples: int) -> list[int]:
+    if num_samples > total:
+        raise ValueError(f"Cannot sample {num_samples} unique ranks from total={total}.")
 
-    A_np = np.load(path)
+    if total <= sys.maxsize:
+        return random.sample(range(total), num_samples)
+
+    seen = set()
+    while len(seen) < num_samples:
+        seen.add(random.randrange(total))
+    return list(seen)
+
+
+def unrank_combination(rank: int, n: int, k: int) -> Tuple[int, ...]:
+    combo = []
+    start = 0
+    remaining = rank
+    for remaining_k in range(k, 0, -1):
+        for value in range(start, n - remaining_k + 1):
+            count = math.comb(n - value - 1, remaining_k - 1)
+            if remaining < count:
+                combo.append(value)
+                start = value + 1
+                break
+            remaining -= count
+    return tuple(combo)
+
+
+def sample_neighborhoods(n: int, k: int, N: int) -> torch.Tensor:
+    total_combinations = math.comb(n, k)
+    ranks = sample_unique_ranks(total_combinations, N)
+    neighborhoods = torch.empty((N, k), dtype=torch.long)
+    for idx, rank in enumerate(ranks):
+        if k == 0:
+            neighborhoods[idx] = torch.empty((0,), dtype=torch.long)
+        else:
+            neighborhoods[idx] = torch.tensor(unrank_combination(rank, n, k), dtype=torch.long)
+    return neighborhoods
+
+
+def neighborhoods_to_csr(neighborhoods: torch.Tensor, n: int) -> sp.csr_matrix:
+    neighborhoods_np = neighborhoods.cpu().numpy()
+    N, k = neighborhoods_np.shape
+    if k == 0:
+        return sp.csr_matrix((N, n), dtype=np.float32)
+
+    row_idx = np.repeat(np.arange(N, dtype=np.int64), k)
+    col_idx = neighborhoods_np.reshape(-1)
+    data = np.ones(N * k, dtype=np.float32)
+    return sp.csr_matrix((data, (row_idx, col_idx)), shape=(N, n), dtype=np.float32)
+
+
+def dense_adjacency_to_neighborhoods(A_np: np.ndarray, expected_k: int) -> torch.Tensor:
     if A_np.ndim != 2:
         raise ValueError(f"Graph array must be 2D, got shape {A_np.shape}.")
-    if A_np.shape != (expected_N, expected_n):
-        raise ValueError(
-            f"Graph shape mismatch: expected {(expected_N, expected_n)}, got {A_np.shape}."
-        )
 
     unique_vals = np.unique(A_np)
     if not np.all(np.isin(unique_vals, [0, 1])):
         raise ValueError(f"Graph must have entries in {{0,1}}, got values {unique_vals}.")
 
+    N = A_np.shape[0]
     row_sums = A_np.sum(axis=1)
     if not np.all(row_sums == expected_k):
         bad_rows = np.where(row_sums != expected_k)[0][:10]
@@ -106,7 +174,68 @@ def load_graph(graph_path: str, expected_N: int, expected_n: int, expected_k: in
             f"Found violations in rows {bad_rows.tolist()}."
         )
 
-    return torch.from_numpy(A_np.astype(np.bool_))
+    if expected_k == 0:
+        neighborhoods = np.empty((N, 0), dtype=np.int64)
+    else:
+        neighborhoods = np.empty((N, expected_k), dtype=np.int64)
+        for i in range(N):
+            neighborhoods[i] = np.flatnonzero(A_np[i]).astype(np.int64, copy=False)
+
+    return torch.from_numpy(neighborhoods).long()
+
+
+def sparse_csr_to_neighborhoods(A_csr: sp.csr_matrix, expected_k: int) -> torch.Tensor:
+    A_csr = A_csr.tocsr()
+    A_csr.sort_indices()
+
+    row_counts = np.diff(A_csr.indptr)
+    if not np.all(row_counts == expected_k):
+        bad_rows = np.where(row_counts != expected_k)[0][:10]
+        raise ValueError(
+            f"Every row must contain exactly k={expected_k} ones. "
+            f"Found violations in rows {bad_rows.tolist()}."
+        )
+
+    unique_vals = np.unique(A_csr.data)
+    if not np.all(np.isin(unique_vals, [0, 1])):
+        raise ValueError(f"Sparse graph must have entries in {{0,1}}, got values {unique_vals}.")
+
+    N = A_csr.shape[0]
+    if expected_k == 0:
+        neighborhoods = np.empty((N, 0), dtype=np.int64)
+    else:
+        neighborhoods = A_csr.indices.reshape(N, expected_k).astype(np.int64, copy=True)
+
+    return torch.from_numpy(neighborhoods).long()
+
+
+def load_graph_neighborhoods(
+    graph_path: str,
+    expected_N: int,
+    expected_n: int,
+    expected_k: int,
+) -> torch.Tensor:
+    path = Path(graph_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Graph file not found: {path}")
+
+    if path.suffix == ".npz":
+        A_sparse = sp.load_npz(path)
+        if A_sparse.shape != (expected_N, expected_n):
+            raise ValueError(
+                f"Graph shape mismatch: expected {(expected_N, expected_n)}, got {A_sparse.shape}."
+            )
+        return sparse_csr_to_neighborhoods(A_sparse, expected_k=expected_k).long()
+
+    if path.suffix == ".npy":
+        A_np = np.load(path)
+        if A_np.shape != (expected_N, expected_n):
+            raise ValueError(
+                f"Graph shape mismatch: expected {(expected_N, expected_n)}, got {A_np.shape}."
+            )
+        return dense_adjacency_to_neighborhoods(A_np, expected_k=expected_k).long()
+
+    raise ValueError(f"Unsupported graph file suffix for {path}. Expected .npz or .npy.")
 
 
 @torch.no_grad()
@@ -133,7 +262,7 @@ def renormalize_rows_inplace(x: torch.Tensor, eps: float = 1e-12) -> None:
 
 
 def initialize_embeddings(
-    A_cpu: torch.Tensor,
+    neighborhoods_cpu: torch.Tensor,
     N: int,
     n: int,
     d: int,
@@ -153,8 +282,9 @@ def initialize_embeddings(
             raise ValueError(
                 f"Spectral initialization requires d <= min(N, n). Got d={d}, N={N}, n={n}."
             )
-        A_float = A_cpu.to(dtype=torch.float32)
-        L, _, Rh = torch.linalg.svd(A_float, full_matrices=False)
+        A_csr = neighborhoods_to_csr(neighborhoods_cpu, n=n)
+        A_dense = torch.from_numpy(A_csr.toarray()).to(dtype=torch.float32)
+        L, _, Rh = torch.linalg.svd(A_dense, full_matrices=False)
         U0 = normalize_rows(L[:, :d].to(device=device))
         V0 = normalize_rows(Rh[:d, :].T.to(device=device))
 
@@ -210,37 +340,69 @@ def auto_row_chunk_size(width: int, target_entries: int = 2_000_000) -> int:
     return max(1, target_entries // max(1, width))
 
 
+def build_subset_position_lookup(n: int, left_subset_cpu: torch.Tensor) -> torch.Tensor:
+    subset_pos = torch.full((n,), -1, dtype=torch.long)
+    subset_pos[left_subset_cpu] = torch.arange(left_subset_cpu.numel(), dtype=torch.long)
+    return subset_pos
+
+
+def build_chunk_adjacency_from_subset_lookup(
+    neighborhoods_chunk_cpu: torch.Tensor,
+    subset_pos_cpu: torch.Tensor,
+    batch_size: int,
+) -> torch.Tensor:
+    neighborhoods_chunk_cpu = neighborhoods_chunk_cpu.long()
+    rows, k = neighborhoods_chunk_cpu.shape
+    A_chunk = torch.zeros((rows, batch_size), dtype=torch.bool)
+
+    if rows == 0 or k == 0 or batch_size == 0:
+        return A_chunk
+
+    selected_pos = subset_pos_cpu[neighborhoods_chunk_cpu]
+    valid = selected_pos >= 0
+    if valid.any():
+        row_ids = torch.arange(rows, dtype=torch.long).unsqueeze(1).expand(-1, k)
+        A_chunk[row_ids[valid], selected_pos[valid]] = True
+
+    return A_chunk
+
+
 def train_one_step(
     U: torch.nn.Parameter,
     V: torch.nn.Parameter,
     b: torch.nn.Parameter,
     t: torch.nn.Parameter,
-    A_cpu: torch.Tensor,
+    neighborhoods_cpu: torch.Tensor,
     batch_size: int,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
 ) -> float:
-    N, n = A_cpu.shape
+    N, k = neighborhoods_cpu.shape
+    n = V.shape[0]
     dtype = U.dtype
     optimizer.zero_grad(set_to_none=True)
 
     left_subset_cpu = torch.randperm(n)[:batch_size]
     left_subset = left_subset_cpu.to(device=device)
+    subset_pos_cpu = build_subset_position_lookup(n=n, left_subset_cpu=left_subset_cpu)
     row_chunk_size = min(N, auto_row_chunk_size(batch_size))
 
     total_loss = 0.0
     for row_start in range(0, N, row_chunk_size):
         row_end = min(row_start + row_chunk_size, N)
+
         U_chunk = U[row_start:row_end]
-        # Recompute V_subset inside the loop so each chunk has its own autograd graph.
-        # Otherwise repeated backward() calls through the same index_select graph trigger
-        # "Trying to backward through the graph a second time".
         V_subset = V.index_select(0, left_subset)
         scores = U_chunk @ V_subset.T
 
-        A_chunk = A_cpu[row_start:row_end].index_select(1, left_subset_cpu)
-        signs = 1.0 - 2.0 * A_chunk.to(device=device, dtype=dtype)
+        neighborhoods_chunk_cpu = neighborhoods_cpu[row_start:row_end].long()
+        A_chunk = build_chunk_adjacency_from_subset_lookup(
+            neighborhoods_chunk_cpu=neighborhoods_chunk_cpu,
+            subset_pos_cpu=subset_pos_cpu,
+            batch_size=batch_size,
+        )
 
+        signs = 1.0 - 2.0 * A_chunk.to(device=device, dtype=dtype)
         chunk_loss = F.softplus(t * (scores - b) * signs).sum()
         chunk_loss.backward()
         total_loss += float(chunk_loss.detach().cpu().item())
@@ -254,8 +416,14 @@ def train_one_step(
 
 
 @torch.no_grad()
-def compute_gap(U: torch.nn.Parameter, V: torch.nn.Parameter, A_cpu: torch.Tensor, device: torch.device) -> Tuple[float, float, float]:
-    N, n = A_cpu.shape
+def compute_margin(
+    U: torch.nn.Parameter,
+    V: torch.nn.Parameter,
+    neighborhoods_cpu: torch.Tensor,
+    device: torch.device,
+) -> Tuple[float, float, float]:
+    N, k = neighborhoods_cpu.shape
+    n = V.shape[0]
     row_chunk_size = min(N, auto_row_chunk_size(n, target_entries=4_000_000))
 
     pos_min = float("inf")
@@ -264,22 +432,25 @@ def compute_gap(U: torch.nn.Parameter, V: torch.nn.Parameter, A_cpu: torch.Tenso
 
     for row_start in range(0, N, row_chunk_size):
         row_end = min(row_start + row_chunk_size, N)
+
         U_chunk = U[row_start:row_end]
         scores = U_chunk @ V_detached.T
-        A_chunk = A_cpu[row_start:row_end].to(device=device)
+        neighborhoods_chunk = neighborhoods_cpu[row_start:row_end].to(device=device, dtype=torch.long)
 
-        pos_mask = A_chunk
-        neg_mask = ~A_chunk
+        if k > 0:
+            pos_scores = scores.gather(1, neighborhoods_chunk)
+            pos_min = min(pos_min, float(pos_scores.min().item()))
 
-        if pos_mask.any():
-            pos_min = min(pos_min, float(scores[pos_mask].min().item()))
-        if neg_mask.any():
-            neg_max = max(neg_max, float(scores[neg_mask].max().item()))
+            masked_scores = scores.clone()
+            masked_scores.scatter_(1, neighborhoods_chunk, float("-inf"))
+            neg_max = max(neg_max, float(masked_scores.max().item()))
+        else:
+            neg_max = max(neg_max, float(scores.max().item()))
 
-    gap = float("nan")
+    margin = float("nan")
     if math.isfinite(pos_min) and math.isfinite(neg_max):
-        gap = pos_min - neg_max
-    return pos_min, neg_max, gap
+        margin = 0.5 * (pos_min - neg_max)
+    return pos_min, neg_max, margin
 
 
 def save_npz(path: Path, **kwargs) -> None:
@@ -304,7 +475,7 @@ def save_checkpoint_npz(
     loss_value: float,
     pos_min: float,
     neg_max: float,
-    gap: float,
+    margin: float,
     lr: float,
 ) -> None:
     ckpt_path = save_dir / f"checkpoint_step_{step:06d}.npz"
@@ -318,7 +489,7 @@ def save_checkpoint_npz(
         loss=loss_value,
         pos_min=pos_min,
         neg_max=neg_max,
-        gap=gap,
+        margin=margin,
         lr=lr,
     )
     save_npz(
@@ -331,17 +502,18 @@ def save_checkpoint_npz(
         loss=loss_value,
         pos_min=pos_min,
         neg_max=neg_max,
-        gap=gap,
+        margin=margin,
         lr=lr,
     )
 
 
-def train_siglip_on_saved_graph(
-    graph_path: str,
-    n: int,
-    d: int,
-    k: int,
-    N: int,
+def train_siglip_bipartite(
+    graph_path: Optional[str] = None,
+    n: int = 0,
+    d: int = 0,
+    k: int = 0,
+    p: Optional[float] = None,
+    N: Optional[int] = None,
     batch_size: Optional[int] = None,
     initialization: str = "random",
     num_steps: int = 1000,
@@ -358,21 +530,41 @@ def train_siglip_on_saved_graph(
 
     set_seed(seed)
     resolved_device = resolve_device(device)
-    batch_size = validate_inputs(n=n, d=d, k=k, N=N, batch_size=batch_size)
+
+    if graph_path is None:
+        N, batch_size = validate_and_resolve_sizes(n=n, d=d, k=k, p=p, N=N, batch_size=batch_size)
+    else:
+        if N is None:
+            raise ValueError("When graph_path is provided, you must also provide N.")
+        if batch_size is None:
+            batch_size = n
+        if not (1 <= batch_size <= n):
+            raise ValueError(f"batch_size must satisfy 1 <= batch_size <= n, got {batch_size}.")
 
     save_dir = Path(save_path)
     save_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Using device: {resolved_device}")
-    print(f"Reading graph from: {graph_path}")
     print(f"Resolved sizes: n={n}, N={N}, d={d}, k={k}, batch_size={batch_size}")
-    A_cpu = load_graph(graph_path=graph_path, expected_N=N, expected_n=n, expected_k=k)
+
+    if graph_path is None:
+        print("Sampling distinct k-neighborhoods...")
+        neighborhoods_cpu = sample_neighborhoods(n=n, k=k, N=N).long()
+    else:
+        print(f"Reading graph from: {graph_path}")
+        neighborhoods_cpu = load_graph_neighborhoods(
+            graph_path=graph_path,
+            expected_N=N,
+            expected_n=n,
+            expected_k=k,
+        ).long()
 
     config = {
-        "graph_path": str(Path(graph_path).resolve()),
+        "graph_path": graph_path,
         "n": n,
         "d": d,
         "k": k,
+        "p": p,
         "N": N,
         "batch_size": batch_size,
         "initialization": initialization,
@@ -386,14 +578,21 @@ def train_siglip_on_saved_graph(
         "device": str(resolved_device),
     }
 
-    save_npz(save_dir / "graph_data.npz", A=A_cpu.to(torch.uint8))
+    save_npz(
+        save_dir / "graph_data.npz",
+        neighborhoods=neighborhoods_cpu,
+        n=n,
+        N=N,
+        k=k,
+    )
     with open(save_dir / "config.json", "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
 
     print(f"Saved graph_data.npz and config.json to {save_dir}")
     print(f"Initializing U and V with '{initialization}' initialization...")
+
     U, V, b, t = initialize_embeddings(
-        A_cpu=A_cpu,
+        neighborhoods_cpu=neighborhoods_cpu,
         N=N,
         n=n,
         d=d,
@@ -412,7 +611,7 @@ def train_siglip_on_saved_graph(
     last_loss = float("nan")
     pos_min = float("nan")
     neg_max = float("nan")
-    gap = float("nan")
+    margin = float("nan")
 
     for step in range(1, num_steps + 1):
         last_loss = train_one_step(
@@ -420,7 +619,7 @@ def train_siglip_on_saved_graph(
             V=V,
             b=b,
             t=t,
-            A_cpu=A_cpu,
+            neighborhoods_cpu=neighborhoods_cpu,
             batch_size=batch_size,
             optimizer=optimizer,
             device=resolved_device,
@@ -429,11 +628,16 @@ def train_siglip_on_saved_graph(
 
         should_save = (step % save_every == 0) or (step == num_steps)
         if should_save:
-            pos_min, neg_max, gap = compute_gap(U=U, V=V, A_cpu=A_cpu, device=resolved_device)
+            pos_min, neg_max, margin = compute_margin(
+                U=U,
+                V=V,
+                neighborhoods_cpu=neighborhoods_cpu,
+                device=resolved_device,
+            )
             current_lr = optimizer.param_groups[0]["lr"]
             print(
                 f"step={step:6d} | loss={last_loss:.6f} | lr={current_lr:.6e} | "
-                f"t={t.item():.6f} | b={b.item():.6f} | gap={gap:.6f}"
+                f"t={t.item():.6f} | b={b.item():.6f} | margin={margin:.6f}"
             )
             save_checkpoint_npz(
                 save_dir=save_dir,
@@ -445,7 +649,7 @@ def train_siglip_on_saved_graph(
                 loss_value=last_loss,
                 pos_min=pos_min,
                 neg_max=neg_max,
-                gap=gap,
+                margin=margin,
                 lr=current_lr,
             )
 
@@ -458,23 +662,26 @@ def train_siglip_on_saved_graph(
         loss=last_loss,
         pos_min=pos_min,
         neg_max=neg_max,
-        gap=gap,
+        margin=margin,
     )
     print(f"Training complete. Final artifacts saved under: {save_dir}")
 
     return {
         "save_dir": str(save_dir),
+        "resolved_N": N,
+        "resolved_batch_size": batch_size,
         "device": str(resolved_device),
     }
 
 
 def main() -> None:
     args = parse_args()
-    train_siglip_on_saved_graph(
+    train_siglip_bipartite(
         graph_path=args.graph_path,
         n=args.n,
         d=args.d,
         k=args.k,
+        p=args.p,
         N=args.N,
         batch_size=args.batch_size,
         initialization=args.initialization,

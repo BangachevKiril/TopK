@@ -4,17 +4,23 @@
 #SBATCH --error=logs/gen_graphs_%A_%a.err
 #SBATCH --time=04:00:00
 #SBATCH --cpus-per-task=1
-#SBATCH --mem=8G
+#SBATCH --mem=32G
 #SBATCH --partition=mit_normal
 
-n_values=(10 20 40 80 160)
-N_values=(10 20 40 80 160 320 640 1280 2560 5120 10240 20480)
+n_values=(10 20 40 80 160 320 640)
+p_values=(0.015625 0.03125 0.0625 0.125 0.25 0.5 1.0)
 k_values=(1 2 3 4 5)
-seed_values=(0 1 2 3 4 5 6 7 8 9)
+seed_values=(0)
+
 NUM_ARRAY_JOBS=20
-OUTPUT_DIR="/home/kirilb/orcd/pool/TopK/SyntheticGraphs"
+MAX_CONCURRENT=20
+NN_THRESHOLD=100000000
+
+OUTPUT_DIR="/home/kirilb/orcd/pool/TopK/SyntheticGraphsSmall"
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_PATH="$(readlink -f "$0")"
 PYTHON_SCRIPT="generate_graph_data.py"
-MANIFEST_DIR="${OUTPUT_DIR}/manifests"
 
 choose() {
     local n=$1
@@ -35,29 +41,109 @@ choose() {
     echo "$result"
 }
 
-mkdir -p logs
-mkdir -p "${OUTPUT_DIR}"
-mkdir -p "${MANIFEST_DIR}"
+compute_N_from_p() {
+    local n=$1
+    local k=$2
+    local p=$3
+    local max_neighborhoods
+    max_neighborhoods=$(choose "$n" "$k")
 
-if [ -z "${SLURM_ARRAY_TASK_ID:-}" ]; then
-    timestamp=$(date +%Y%m%d_%H%M%S)
-    manifest="${MANIFEST_DIR}/graph_manifest_${timestamp}.txt"
-    : > "${manifest}"
+    python - <<PY
+import math
+p = float("${p}")
+M = int("${max_neighborhoods}")
+print(math.floor(p * M))
+PY
+}
+
+passes_min_size_check() {
+    local n=$1
+    local k=$2
+    local p=$3
+    local max_neighborhoods
+    max_neighborhoods=$(choose "$n" "$k")
+
+    python - <<PY
+n = int("${n}")
+p = float("${p}")
+M = int("${max_neighborhoods}")
+print(1 if p * M >= n  else 0)
+PY
+}
+
+valid_N_for_triplet() {
+    local n=$1
+    local k=$2
+    local p=$3
+
+    local max_neighborhoods
+    local keep_small
+    local N
+
+    max_neighborhoods=$(choose "$n" "$k")
+
+    keep_small=$(passes_min_size_check "$n" "$k" "$p")
+    if [ "$keep_small" -ne 1 ]; then
+        return 1
+    fi
+
+    N=$(compute_N_from_p "$n" "$k" "$p")
+
+    if [ "$N" -lt 1 ] || [ "$N" -gt "$max_neighborhoods" ]; then
+        return 1
+    fi
+
+    if [ $((n * N)) -gt "$NN_THRESHOLD" ]; then
+        return 1
+    fi
+
+    echo "$N"
+    return 0
+}
+
+count_total_runs() {
+    local total=0
+    local n k p N
+    for n in "${n_values[@]}"; do
+        for k in "${k_values[@]}"; do
+            for p in "${p_values[@]}"; do
+                N=$(valid_N_for_triplet "$n" "$k" "$p") || continue
+                total=$((total + ${#seed_values[@]}))
+            done
+        done
+    done
+    echo "$total"
+}
+
+get_run_by_index() {
+    local target_idx=$1
+    local current_idx=0
+    local n k p N seed
 
     for n in "${n_values[@]}"; do
-        for N in "${N_values[@]}"; do
-            for k in "${k_values[@]}"; do
-                max_neighborhoods=$(choose "$n" "$k")
-                if [ "$N" -le "$max_neighborhoods" ]; then
-                    for seed in "${seed_values[@]}"; do
-                        echo "${n} ${k} ${N} ${seed}" >> "${manifest}"
-                    done
-                fi
+        for k in "${k_values[@]}"; do
+            for p in "${p_values[@]}"; do
+                N=$(valid_N_for_triplet "$n" "$k" "$p") || continue
+                for seed in "${seed_values[@]}"; do
+                    if [ "$current_idx" -eq "$target_idx" ]; then
+                        echo "${n} ${k} ${p} ${N} ${seed}"
+                        return 0
+                    fi
+                    current_idx=$((current_idx + 1))
+                done
             done
         done
     done
 
-    total_runs=$(wc -l < "${manifest}")
+    return 1
+}
+
+mkdir -p logs
+mkdir -p "${OUTPUT_DIR}"
+
+if [ -z "${SLURM_ARRAY_TASK_ID:-}" ]; then
+    total_runs=$(count_total_runs)
+
     if [ "$total_runs" -eq 0 ]; then
         echo "No valid runs found."
         exit 1
@@ -68,27 +154,25 @@ if [ -z "${SLURM_ARRAY_TASK_ID:-}" ]; then
         array_count=${total_runs}
     fi
 
-    echo "Manifest: ${manifest}"
-    echo "Total valid runs: ${total_runs}"
+    echo "SCRIPT_PATH=${SCRIPT_PATH}"
+    echo "PYTHON_SCRIPT=${PYTHON_SCRIPT}"
+    echo "OUTPUT_DIR=${OUTPUT_DIR}"
+    echo "TOTAL_RUNS=${total_runs}"
+    echo "ARRAY_COUNT=${array_count}"
     echo "Submitting ${array_count} array tasks."
 
     sbatch \
-        --array=0-$((array_count - 1)) \
-        --export=ALL,MANIFEST="${manifest}",TOTAL_RUNS="${total_runs}",ARRAY_COUNT="${array_count}" \
-        "$0"
+        --array=0-$((array_count - 1))%${MAX_CONCURRENT} \
+        --export=ALL,TOTAL_RUNS="${total_runs}",ARRAY_COUNT="${array_count}",NN_THRESHOLD="${NN_THRESHOLD}",OUTPUT_DIR="${OUTPUT_DIR}" \
+        "${SCRIPT_PATH}"
     exit $?
 fi
 
 module load miniforge
 source activate GPUenv
 
-if [ -z "${MANIFEST:-}" ] || [ -z "${TOTAL_RUNS:-}" ] || [ -z "${ARRAY_COUNT:-}" ]; then
-    echo "Missing MANIFEST, TOTAL_RUNS, or ARRAY_COUNT in environment."
-    exit 1
-fi
-
-if [ ! -f "${MANIFEST}" ]; then
-    echo "Manifest file not found: ${MANIFEST}"
+if [ -z "${TOTAL_RUNS:-}" ] || [ -z "${ARRAY_COUNT:-}" ]; then
+    echo "Missing TOTAL_RUNS or ARRAY_COUNT in environment."
     exit 1
 fi
 
@@ -102,36 +186,41 @@ base=$(( TOTAL_RUNS / ARRAY_COUNT ))
 extra=$(( TOTAL_RUNS % ARRAY_COUNT ))
 
 if [ "${task_id}" -lt "${extra}" ]; then
-    start=$(( task_id * (base + 1) + 1 ))
+    start=$(( task_id * (base + 1) ))
     end=$(( start + base ))
 else
-    start=$(( extra * (base + 1) + (task_id - extra) * base + 1 ))
+    start=$(( extra * (base + 1) + (task_id - extra) * base ))
     end=$(( start + base - 1 ))
 fi
 
-if [ "${start}" -gt "${TOTAL_RUNS}" ]; then
+if [ "${start}" -ge "${TOTAL_RUNS}" ]; then
     echo "Task ${task_id} has no assigned runs."
     exit 0
 fi
 
-if [ "${end}" -gt "${TOTAL_RUNS}" ]; then
-    end=${TOTAL_RUNS}
+if [ "${end}" -ge "${TOTAL_RUNS}" ]; then
+    end=$((TOTAL_RUNS - 1))
 fi
 
-echo "Task ${task_id} processing manifest lines ${start} through ${end}."
+echo "SLURM_JOB_ID=${SLURM_JOB_ID}"
+echo "SLURM_ARRAY_TASK_ID=${SLURM_ARRAY_TASK_ID}"
+echo "Task ${task_id} processing run indices ${start} through ${end}."
 
-for line_no in $(seq "${start}" "${end}"); do
-    line=$(sed -n "${line_no}p" "${MANIFEST}")
-    n=$(echo "${line}" | awk '{print $1}')
-    k=$(echo "${line}" | awk '{print $2}')
-    N=$(echo "${line}" | awk '{print $3}')
-    seed=$(echo "${line}" | awk '{print $4}')
+for global_idx in $(seq "${start}" "${end}"); do
+    run_spec=$(get_run_by_index "${global_idx}")
+    if [ $? -ne 0 ] || [ -z "${run_spec}" ]; then
+        echo "Failed to recover run for global_idx=${global_idx}"
+        exit 1
+    fi
 
-    echo "Running n=${n}, k=${k}, N=${N}, seed=${seed}"
+    read -r n k p N seed <<< "${run_spec}"
+
+    echo "Running n=${n}, k=${k}, p=${p}, N=${N}, seed=${seed}"
     python "${PYTHON_SCRIPT}" \
         --n "${n}" \
         --k "${k}" \
-        --N "${N}" \
+        --p "${p}" \
         --seed "${seed}" \
+        --nn_threshold "${NN_THRESHOLD}" \
         --output_dir "${OUTPUT_DIR}"
 done
