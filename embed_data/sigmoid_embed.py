@@ -8,7 +8,8 @@ This version:
   - falls back to legacy dense .npy graph files when needed,
   - recursively-friendly: graph_path may live anywhere,
   - saves checkpoints as compressed .npz files,
-  - tracks margin, defined as gap / 2.
+  - tracks margin, defined as gap / 2,
+  - optionally fixes the bias to a user-provided constant via --relative_bias.
 """
 
 from __future__ import annotations
@@ -43,6 +44,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-2)
     parser.add_argument("--min_lr_ratio", type=float, default=1e-2)
     parser.add_argument("--warmup_frac", type=float, default=0.05)
+    parser.add_argument(
+        "--relative_bias",
+        type=float,
+        default=None,
+        help="If provided, fix the bias b to this constant and do not optimize it.",
+    )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--device", type=str, default=None)
     return parser.parse_args()
@@ -268,6 +275,7 @@ def initialize_embeddings(
     d: int,
     initialization: str,
     device: torch.device,
+    relative_bias: Optional[float] = None,
 ) -> Tuple[torch.nn.Parameter, torch.nn.Parameter, torch.nn.Parameter, torch.nn.Parameter]:
     if initialization not in {"random", "spectral"}:
         raise ValueError(f"Unknown initialization: {initialization}")
@@ -290,7 +298,15 @@ def initialize_embeddings(
 
     U = torch.nn.Parameter(U0)
     V = torch.nn.Parameter(V0)
-    b = torch.nn.Parameter(torch.zeros(1, 1, device=device))
+
+    if relative_bias is None:
+        b = torch.nn.Parameter(torch.zeros(1, 1, device=device))
+    else:
+        b = torch.nn.Parameter(
+            torch.full((1, 1), float(relative_bias), device=device),
+            requires_grad=False,
+        )
+
     t = torch.nn.Parameter(torch.ones(1, 1, device=device))
     return U, V, b, t
 
@@ -305,7 +321,11 @@ def make_optimizer_and_scheduler(params, num_steps: int, lr: float, min_lr_ratio
     if not (0.0 <= warmup_frac < 1.0):
         raise ValueError(f"warmup_frac must lie in [0, 1), got {warmup_frac}.")
 
-    optimizer = torch.optim.Adam(params, lr=lr)
+    trainable_params = [param for param in params if getattr(param, "requires_grad", False)]
+    if not trainable_params:
+        raise ValueError("No trainable parameters were provided to the optimizer.")
+
+    optimizer = torch.optim.Adam(trainable_params, lr=lr)
     warmup_steps = max(1, int(round(num_steps * warmup_frac))) if num_steps > 1 and warmup_frac > 0 else 0
     decay_steps = max(1, num_steps - warmup_steps)
 
@@ -370,7 +390,7 @@ def build_chunk_adjacency_from_subset_lookup(
 def train_one_step(
     U: torch.nn.Parameter,
     V: torch.nn.Parameter,
-    b: torch.nn.Parameter,
+    b: torch.Tensor,
     t: torch.nn.Parameter,
     neighborhoods_cpu: torch.Tensor,
     batch_size: int,
@@ -470,7 +490,7 @@ def save_checkpoint_npz(
     step: int,
     U: torch.nn.Parameter,
     V: torch.nn.Parameter,
-    b: torch.nn.Parameter,
+    b: torch.Tensor,
     t: torch.nn.Parameter,
     loss_value: float,
     pos_min: float,
@@ -522,6 +542,7 @@ def train_siglip_bipartite(
     lr: float = 1e-2,
     min_lr_ratio: float = 1e-2,
     warmup_frac: float = 0.05,
+    relative_bias: Optional[float] = None,
     seed: Optional[int] = None,
     device: Optional[str] = None,
 ) -> Dict:
@@ -546,6 +567,10 @@ def train_siglip_bipartite(
 
     print(f"Using device: {resolved_device}")
     print(f"Resolved sizes: n={n}, N={N}, d={d}, k={k}, batch_size={batch_size}")
+    if relative_bias is None:
+        print("Bias mode: trainable")
+    else:
+        print(f"Bias mode: fixed at relative_bias={relative_bias}")
 
     if graph_path is None:
         print("Sampling distinct k-neighborhoods...")
@@ -574,6 +599,7 @@ def train_siglip_bipartite(
         "lr": lr,
         "min_lr_ratio": min_lr_ratio,
         "warmup_frac": warmup_frac,
+        "relative_bias": relative_bias,
         "seed": seed,
         "device": str(resolved_device),
     }
@@ -598,6 +624,7 @@ def train_siglip_bipartite(
         d=d,
         initialization=initialization,
         device=resolved_device,
+        relative_bias=relative_bias,
     )
 
     optimizer, scheduler = make_optimizer_and_scheduler(
@@ -670,6 +697,7 @@ def train_siglip_bipartite(
         "save_dir": str(save_dir),
         "resolved_N": N,
         "resolved_batch_size": batch_size,
+        "relative_bias": relative_bias,
         "device": str(resolved_device),
     }
 
@@ -691,6 +719,7 @@ def main() -> None:
         lr=args.lr,
         min_lr_ratio=args.min_lr_ratio,
         warmup_frac=args.warmup_frac,
+        relative_bias=args.relative_bias,
         seed=args.seed,
         device=args.device,
     )

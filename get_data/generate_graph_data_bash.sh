@@ -16,7 +16,7 @@ NUM_ARRAY_JOBS=20
 MAX_CONCURRENT=20
 NN_THRESHOLD=100000000
 
-OUTPUT_DIR="/home/kirilb/orcd/pool/TopK/SyntheticGraphsSmall"
+OUTPUT_DIR="/home/kirilb/orcd/scratch/TopK/SyntheticGraphsSmall"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT_PATH="$(readlink -f "$0")"
