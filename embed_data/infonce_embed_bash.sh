@@ -9,25 +9,32 @@
 #SBATCH -e logs/%x_%A_%a.err
 
 # ============================================================
-# Recursively embed all saved synthetic graphs under GRAPH_ROOT
-# using a trainable-temperature InfoNCE objective.
+# Embed all saved synthetic graphs directly under GRAPH_ROOT (non-recursive).
 #
 # Usage:
-#   bash infonce_embed_bash.sh /path/to/graph_root /path/to/out_root
+#   bash infonce_embed_bash.sh /path/to/graph_root /path/to/out_root [relative_bias]
+#
+# GRAPH_ROOT is scanned non-recursively: only files directly inside it are considered.
+#
+# Optional:
+#   relative_bias
+#     Kept for interface compatibility with the sigmoid script.
+#     For InfoNCE, a global scalar bias is mathematically inert.
 #
 # This version:
 #   1) does NOT use manifests,
-#   2) recursively scans GRAPH_ROOT for graph_n_*_k_*_N_*_seed_*.npz
+#   2) scans only GRAPH_ROOT itself for graph_n_*_k_*_N_*_seed_*.npz
 #      (and legacy .npy if no .npz twin exists),
 #   3) parses n, k, N, seed from the filename,
-#   4) mirrors the same relative subfolder structure under OUT_ROOT,
-#   5) runs one embedding job per (graph, d).
+#   4) saves outputs directly under OUT_ROOT/<graph_stem>/d_<d>,
+#   5) launches exactly one Slurm array task per graph,
+#   6) each array task loops over all d values exactly once.
 # ============================================================
 
 # ------------------------
 # Embedding dimensions
 # ------------------------
-d_values=(2 3 4 5 6 7 8 9 10 11 12 25 50 100)
+d_values=(2 3 4 5 6 7 8 9 10 11 12 13 14 25 50 100)
 
 # ------------------------
 # Training settings
@@ -41,12 +48,16 @@ MIN_LR_RATIO=0.01
 WARMUP_FRAC=0.05
 TEMPERATURE=0.1
 DEVICE=""
+RELATIVE_BIAS=0
 
-ARRAY_JOBS=40
 MAX_CONCURRENT=20
 
-GRAPH_ROOT="${1:-${GRAPH_ROOT:-/home/kirilb/orcd/pool/TopK/SyntheticGraphsSmall}}"
-OUT_ROOT="${2:-${OUT_ROOT:-/home/kirilb/orcd/pool/TopK/SyntheticEmbeddingsSmall/infonce_${INITIALIZATION}_initialization}}"
+GRAPH_ROOT="${1:-${GRAPH_ROOT:-/home/kirilb/orcd/scratch/TopK/SyntheticGraphsSmall}}"
+BASE_OUT_ROOT="${2:-${OUT_ROOT:-/home/kirilb/orcd/scratch/TopK/SyntheticEmbeddingsSmall/infonce_${INITIALIZATION}_initialization}}"
+OUT_ROOT="${BASE_OUT_ROOT}"
+if [ "${RELATIVE_BIAS+x}" = x ]; then
+    OUT_ROOT="${BASE_OUT_ROOT}/b_rel_${RELATIVE_BIAS}"
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT_PATH="$(readlink -f "$0")"
@@ -57,13 +68,13 @@ list_graphs_unique() {
 
     while IFS= read -r path; do
         echo "$path"
-    done < <(find "$graph_root" -type f -name 'graph_n_*_k_*_N_*_seed_*.npz' | sort)
+    done < <(find "$graph_root" -maxdepth 1 -type f -name 'graph_n_*_k_*_N_*_seed_*.npz' | sort)
 
     while IFS= read -r path; do
         if [ ! -f "${path%.npy}.npz" ]; then
             echo "$path"
         fi
-    done < <(find "$graph_root" -type f -name 'graph_n_*_k_*_N_*_seed_*.npy' | sort)
+    done < <(find "$graph_root" -maxdepth 1 -type f -name 'graph_n_*_k_*_N_*_seed_*.npy' | sort)
 }
 
 parse_graph_metadata() {
@@ -118,87 +129,75 @@ if [ "${TOTAL_GRAPHS}" -eq 0 ]; then
 fi
 
 if [ -z "${SLURM_ARRAY_TASK_ID:-}" ]; then
-    array_count=${ARRAY_JOBS}
-    if [ "${TOTAL_RUNS}" -lt "${array_count}" ]; then
-        array_count=${TOTAL_RUNS}
-    fi
-
     echo "SCRIPT_PATH=${SCRIPT_PATH}"
     echo "PYTHON_SCRIPT=${PYTHON_SCRIPT}"
     echo "GRAPH_ROOT=${GRAPH_ROOT}"
     echo "OUT_ROOT=${OUT_ROOT}"
+    echo "TEMPERATURE=${TEMPERATURE}"
+    if [ -n "${RELATIVE_BIAS}" ]; then
+        echo "RELATIVE_BIAS=${RELATIVE_BIAS} (fixed; inert for InfoNCE)"
+    else
+        echo "RELATIVE_BIAS=<trainable bias; inert for InfoNCE>"
+    fi
     echo "TOTAL_GRAPHS=${TOTAL_GRAPHS}"
     echo "NUM_D_VALUES=${NUM_D_VALUES}"
     echo "TOTAL_RUNS=${TOTAL_RUNS}"
-    echo "Submitting ${array_count} array tasks."
+    echo "Submitting one array task per graph."
 
     sbatch \
-        --array=0-$((array_count - 1))%${MAX_CONCURRENT} \
-        --export=ALL,GRAPH_ROOT="${GRAPH_ROOT}",OUT_ROOT="${OUT_ROOT}",TOTAL_RUNS="${TOTAL_RUNS}",ARRAY_COUNT="${array_count}" \
+        --array=0-$((TOTAL_GRAPHS - 1))%${MAX_CONCURRENT} \
+        --export=ALL,GRAPH_ROOT="${GRAPH_ROOT}",OUT_ROOT="${OUT_ROOT}",RELATIVE_BIAS="${RELATIVE_BIAS}",TEMPERATURE="${TEMPERATURE}" \
         "${SCRIPT_PATH}"
     exit $?
 fi
 
 module load miniforge
-source activate GPUenv
-
-if [ -z "${TOTAL_RUNS:-}" ] || [ -z "${ARRAY_COUNT:-}" ]; then
-    echo "Missing TOTAL_RUNS or ARRAY_COUNT in environment."
-    exit 1
-fi
+CONDA_BASE="$(conda info --base)"
+source "${CONDA_BASE}/etc/profile.d/conda.sh"
+conda activate GPUenv
 
 if [ ! -f "${PYTHON_SCRIPT}" ]; then
     echo "Python script not found: ${PYTHON_SCRIPT}"
     exit 1
 fi
 
-task_id=${SLURM_ARRAY_TASK_ID}
-base=$(( TOTAL_RUNS / ARRAY_COUNT ))
-extra=$(( TOTAL_RUNS % ARRAY_COUNT ))
+graph_idx=${SLURM_ARRAY_TASK_ID}
 
-if [ "${task_id}" -lt "${extra}" ]; then
-    start=$(( task_id * (base + 1) ))
-    end=$(( start + base ))
-else
-    start=$(( extra * (base + 1) + (task_id - extra) * base ))
-    end=$(( start + base - 1 ))
+if [ "${graph_idx}" -lt 0 ] || [ "${graph_idx}" -ge "${TOTAL_GRAPHS}" ]; then
+    echo "Invalid array index ${graph_idx}; TOTAL_GRAPHS=${TOTAL_GRAPHS}."
+    exit 1
 fi
 
-if [ "${start}" -ge "${TOTAL_RUNS}" ]; then
-    echo "Task ${task_id} has no assigned runs."
-    exit 0
+graph_path="${GRAPH_PATHS[$graph_idx]}"
+metadata="$(parse_graph_metadata "${graph_path}")"
+if [ $? -ne 0 ] || [ -z "${metadata}" ]; then
+    echo "Could not parse metadata from graph file: ${graph_path}"
+    exit 1
 fi
 
-if [ "${end}" -ge "${TOTAL_RUNS}" ]; then
-    end=$((TOTAL_RUNS - 1))
-fi
+read -r n k N seed <<< "${metadata}"
 
 echo "SLURM_JOB_ID=${SLURM_JOB_ID}"
 echo "SLURM_ARRAY_TASK_ID=${SLURM_ARRAY_TASK_ID}"
 echo "GRAPH_ROOT=${GRAPH_ROOT}"
 echo "OUT_ROOT=${OUT_ROOT}"
-echo "Task ${task_id} processing run indices ${start} through ${end}."
+echo "TEMPERATURE=${TEMPERATURE}"
+if [ -n "${RELATIVE_BIAS}" ]; then
+    echo "RELATIVE_BIAS=${RELATIVE_BIAS} (fixed; inert for InfoNCE)"
+else
+    echo "RELATIVE_BIAS=<trainable bias; inert for InfoNCE>"
+fi
+echo "NUM_D_VALUES=${NUM_D_VALUES}"
+echo "--------------------------------------------------"
+echo "graph_idx=${graph_idx} n=${n} k=${k} N=${N} seed=${seed}"
+echo "graph_path=${graph_path}"
 
-for global_idx in $(seq "${start}" "${end}"); do
-    graph_idx=$(( global_idx / NUM_D_VALUES ))
-    d_idx=$(( global_idx % NUM_D_VALUES ))
-
-    graph_path="${GRAPH_PATHS[$graph_idx]}"
-    d="${d_values[$d_idx]}"
-
-    metadata="$(parse_graph_metadata "${graph_path}")"
-    if [ $? -ne 0 ] || [ -z "${metadata}" ]; then
-        echo "Could not parse metadata from graph file: ${graph_path}"
-        exit 1
-    fi
-
-    read -r n k N seed <<< "${metadata}"
-
+for d in "${d_values[@]}"; do
     run_dir="$(build_run_dir "${graph_path}" "${d}")"
     mkdir -p "${run_dir}"
 
     echo "--------------------------------------------------"
-    echo "global_idx=${global_idx} n=${n} k=${k} N=${N} d=${d} seed=${seed}"
+    echo "n=${n} k=${k} N=${N} d=${d} seed=${seed}"
     echo "graph_path=${graph_path}"
     echo "save_path=${run_dir}"
 
@@ -226,6 +225,10 @@ for global_idx in $(seq "${start}" "${end}"); do
 
     if [ -n "${DEVICE}" ]; then
         cmd+=(--device "${DEVICE}")
+    fi
+
+    if [ -n "${RELATIVE_BIAS}" ]; then
+        cmd+=(--relative_bias "${RELATIVE_BIAS}")
     fi
 
     printf 'Running command:\n'

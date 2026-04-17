@@ -4,12 +4,12 @@
 #SBATCH --error=logs/spectral_bounds_%A_%a.err
 #SBATCH --time=12:00:00
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=32G
-#SBATCH --partition=mit_normal
+#SBATCH --mem=128G
+#SBATCH --partition=mit_preemptable
 
 # ============================================================
-# Solve the spectral-bound CVXPY problem for every graph stored
-# directly in GRAPH_ROOT, where the graph files are named
+# Solve the spectral-bound CVXPY problem for selected graphs
+# stored directly in GRAPH_ROOT, where graph files are named
 #
 #   graph_n_<n>_k_<k>_N_<N>_seed_<seed>.npz
 #
@@ -21,26 +21,19 @@
 #
 #   GRAPH_ROOT/spectral_bounds/<graph_filename>.npz
 #
-# This launcher submits ONE Slurm ARRAY JOB with one array index
+# This launcher submits ONE Slurm array job with one array index
 # per graph, and at most RELEASE_AT_MOST tasks running at once.
 #
-# Usage:
-#   bash spectral_bounds_bash.sh /path/to/graph_folder
+# Edit GRAPH_ROOT_RAW and WHICH_JOBS_RAW below.
 #
-# or:
-#   GRAPH_ROOT=/path/to/graph_folder bash spectral_bounds_bash.sh
-#
-# Optional environment variables:
-#   RELEASE_AT_MOST=20
-#   OVERWRITE=0
-#   SOLVER=auto
-#   MAX_ENTRIES=
-#   SCS_EPS=1e-5
-#   SCS_MAX_ITERS=20000
-#   VERBOSE=0
+# Use:
+#   WHICH_JOBS_RAW="-1"
+# to run all jobs.
 # ============================================================
 
 GRAPH_ROOT_RAW="/home/kirilb/orcd/scratch/TopK/SyntheticGraphsSmall"
+WHICH_JOBS_RAW="19,26,27,28,29,30,31,32,51,54,59,61,63,66,67,78,80,81,83,85,87,88,89,90,91,92,93,94,95,96,97,98,100,109,111,113,115,116,117,118,119,120,121,122,123"
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT_PATH="$(readlink -f "$0")"
 PYTHON_SCRIPT="spectral_bounds.py"
@@ -59,12 +52,59 @@ list_all_graphs() {
     find "$graph_root" -maxdepth 1 -type f -name 'graph_n_*_k_*_N_*_seed_*.npz' | sort
 }
 
+normalize_job_list() {
+    local raw="$1"
+
+    if [ "$raw" = "-1" ]; then
+        echo "-1"
+        return 0
+    fi
+
+    raw="${raw//,/ }"
+    raw="$(echo "$raw" | xargs)"
+
+    if [ -z "$raw" ]; then
+        echo "Empty WHICH_JOBS list."
+        return 1
+    fi
+
+    local out=()
+    local tok
+    for tok in $raw; do
+        if ! [[ "$tok" =~ ^[0-9]+$ ]]; then
+            echo "Invalid WHICH_JOBS entry: $tok"
+            return 1
+        fi
+        out+=("$tok")
+    done
+
+    printf '%s\n' "${out[@]}" | sort -n | uniq | paste -sd, -
+}
+
+validate_job_list_against_total() {
+    local which_jobs_csv="$1"
+    local total_graphs="$2"
+
+    if [ "$which_jobs_csv" = "-1" ]; then
+        return 0
+    fi
+
+    local token
+    IFS=',' read -r -a _which_jobs_arr <<< "$which_jobs_csv"
+    for token in "${_which_jobs_arr[@]}"; do
+        if [ "$token" -lt 0 ] || [ "$token" -ge "$total_graphs" ]; then
+            echo "WHICH_JOBS contains out-of-range index $token for TOTAL_GRAPHS=$total_graphs"
+            return 1
+        fi
+    done
+
+    return 0
+}
+
 mkdir -p "$LOG_DIR"
 
 if [ -z "$GRAPH_ROOT_RAW" ]; then
-    echo "GRAPH_ROOT was not provided."
-    echo "Usage: bash $(basename "$0") /path/to/graph_folder"
-    echo "   or: GRAPH_ROOT=/path/to/graph_folder bash $(basename "$0")"
+    echo "GRAPH_ROOT_RAW is empty."
     exit 1
 fi
 
@@ -91,6 +131,11 @@ if ! [[ "$OVERWRITE" =~ ^[0-9]+$ ]] || { [ "$OVERWRITE" -ne 0 ] && [ "$OVERWRITE
     exit 1
 fi
 
+WHICH_JOBS_NORMALIZED="$(normalize_job_list "$WHICH_JOBS_RAW")"
+if [ $? -ne 0 ]; then
+    exit 1
+fi
+
 if [ -z "${SLURM_ARRAY_TASK_ID:-}" ]; then
     mkdir -p "$OUTPUT_DIR"
 
@@ -107,6 +152,17 @@ if [ -z "${SLURM_ARRAY_TASK_ID:-}" ]; then
         exit 1
     fi
 
+    if ! validate_job_list_against_total "$WHICH_JOBS_NORMALIZED" "$TOTAL_GRAPHS"; then
+        rm -f "$GRAPH_LIST_FILE"
+        exit 1
+    fi
+
+    if [ "$WHICH_JOBS_NORMALIZED" = "-1" ]; then
+        ARRAY_SPEC="0-$((TOTAL_GRAPHS - 1))%${RELEASE_AT_MOST}"
+    else
+        ARRAY_SPEC="${WHICH_JOBS_NORMALIZED}%${RELEASE_AT_MOST}"
+    fi
+
     echo "SCRIPT_PATH=$SCRIPT_PATH"
     echo "PYTHON_SCRIPT=$PYTHON_SCRIPT"
     echo "GRAPH_ROOT=$GRAPH_ROOT"
@@ -116,10 +172,12 @@ if [ -z "${SLURM_ARRAY_TASK_ID:-}" ]; then
     echo "RELEASE_AT_MOST=$RELEASE_AT_MOST"
     echo "OVERWRITE=$OVERWRITE"
     echo "SOLVER=$SOLVER"
-    echo "Submitting one array job with $TOTAL_GRAPHS tasks."
+    echo "WHICH_JOBS=$WHICH_JOBS_NORMALIZED"
+    echo "ARRAY_SPEC=$ARRAY_SPEC"
+    echo "Submitting one array job."
 
     sbatch \
-        --array=0-$((TOTAL_GRAPHS - 1))%${RELEASE_AT_MOST} \
+        --array="$ARRAY_SPEC" \
         --export=ALL,GRAPH_ROOT="$GRAPH_ROOT",OUTPUT_DIR="$OUTPUT_DIR",GRAPH_LIST_FILE="$GRAPH_LIST_FILE",TOTAL_GRAPHS="$TOTAL_GRAPHS",OVERWRITE="$OVERWRITE",SOLVER="$SOLVER",MAX_ENTRIES="$MAX_ENTRIES",SCS_EPS="$SCS_EPS",SCS_MAX_ITERS="$SCS_MAX_ITERS",VERBOSE="$VERBOSE" \
         "$SCRIPT_PATH"
     exit $?

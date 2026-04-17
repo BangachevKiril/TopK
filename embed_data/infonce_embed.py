@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """
-Train embeddings on a bipartite graph using a full-batch InfoNCE objective
-with a trainable temperature parameter.
+Train InfoNCE-style embeddings on a random bipartite graph with distinct k-neighborhoods.
 
-This version:
+This version intentionally mirrors sigmoid_embed.py as closely as possible:
   - loads sparse graph files saved as scipy .npz,
   - keeps the graph in compact neighborhood form in memory,
   - falls back to legacy dense .npy graph files when needed,
-  - saves graph_data.npz, config.json, checkpoint_step_XXXXXX.npz, latest.npz,
-    and final.npz,
-  - mirrors the sigmoid saved-file layout as closely as possible,
-  - tracks margin = (pos_min - neg_max) / 2 instead of gap.
+  - recursively-friendly: graph_path may live anywhere,
+  - saves checkpoints as compressed .npz files,
+  - tracks margin, defined as gap / 2,
+  - accepts --relative_bias for interface compatibility with the sigmoid script.
+
+Important note:
+  In row-wise InfoNCE, a global scalar bias b cancels out of the softmax, so it is
+  mathematically inert. We still keep it in the interface and saved outputs so that
+  the file layout and run logic match the sigmoid version as closely as possible.
 """
 
 from __future__ import annotations
@@ -45,7 +49,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-2)
     parser.add_argument("--min_lr_ratio", type=float, default=1e-2)
     parser.add_argument("--warmup_frac", type=float, default=0.05)
-    parser.add_argument("--temperature", type=float, default=0.1)
+    parser.add_argument(
+        "--relative_bias",
+        type=float,
+        default=None,
+        help="Kept for compatibility with sigmoid_embed.py. In InfoNCE this scalar bias is inert.",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.1,
+        help="Initial softmax temperature for InfoNCE.",
+    )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--device", type=str, default=None)
     return parser.parse_args()
@@ -80,8 +95,8 @@ def validate_and_resolve_sizes(
         raise ValueError(f"n must be positive, got {n}.")
     if d <= 0:
         raise ValueError(f"d must be positive, got {d}.")
-    if not (0 < k <= n):
-        raise ValueError(f"k must satisfy 1 <= k <= n, got k={k}, n={n}.")
+    if not (1 <= k <= n):
+        raise ValueError(f"k must satisfy 1 <= k <= n for InfoNCE, got k={k}, n={n}.")
     if temperature <= 0:
         raise ValueError(f"temperature must be positive, got {temperature}.")
 
@@ -105,12 +120,8 @@ def validate_and_resolve_sizes(
 
     if batch_size is None:
         batch_size = n
-    if batch_size != n:
-        print(
-            f"Warning: batch_size={batch_size} was provided, but InfoNCE training here is full-batch "
-            f"over all n={n} left vertices. Ignoring batch_size."
-        )
-        batch_size = n
+    if not (1 <= batch_size <= n):
+        raise ValueError(f"batch_size must satisfy 1 <= batch_size <= n, got {batch_size}.")
 
     return N, batch_size
 
@@ -180,7 +191,7 @@ def dense_adjacency_to_neighborhoods(A_np: np.ndarray, expected_k: int) -> torch
 
     neighborhoods = np.empty((N, expected_k), dtype=np.int64)
     for i in range(N):
-        neighborhoods[i] = np.flatnonzero(A_np[i])
+        neighborhoods[i] = np.flatnonzero(A_np[i]).astype(np.int64, copy=False)
 
     return torch.from_numpy(neighborhoods).long()
 
@@ -202,7 +213,7 @@ def sparse_csr_to_neighborhoods(A_csr: sp.csr_matrix, expected_k: int) -> torch.
         raise ValueError(f"Sparse graph must have entries in {{0,1}}, got values {unique_vals}.")
 
     N = A_csr.shape[0]
-    neighborhoods = A_csr.indices.reshape(N, expected_k).copy()
+    neighborhoods = A_csr.indices.reshape(N, expected_k).astype(np.int64, copy=True)
     return torch.from_numpy(neighborhoods).long()
 
 
@@ -217,7 +228,11 @@ def load_graph_neighborhoods(
         raise FileNotFoundError(f"Graph file not found: {path}")
 
     if path.suffix == ".npz":
-        A_sparse = sp.load_npz(path)
+        try:
+            A_sparse = sp.load_npz(path)
+        except Exception as exc:
+            raise ValueError(f"Failed to load sparse .npz graph from {path}: {exc}") from exc
+
         if A_sparse.shape != (expected_N, expected_n):
             raise ValueError(
                 f"Graph shape mismatch: expected {(expected_N, expected_n)}, got {A_sparse.shape}."
@@ -264,9 +279,10 @@ def initialize_embeddings(
     n: int,
     d: int,
     initialization: str,
-    temperature_init: float,
     device: torch.device,
-) -> Tuple[torch.nn.Parameter, torch.nn.Parameter, torch.nn.Parameter]:
+    relative_bias: Optional[float] = None,
+    temperature: float = 0.1,
+) -> Tuple[torch.nn.Parameter, torch.nn.Parameter, torch.nn.Parameter, torch.nn.Parameter]:
     if initialization not in {"random", "spectral"}:
         raise ValueError(f"Unknown initialization: {initialization}")
 
@@ -288,8 +304,17 @@ def initialize_embeddings(
 
     U = torch.nn.Parameter(U0)
     V = torch.nn.Parameter(V0)
-    log_t = torch.nn.Parameter(torch.full((1, 1), math.log(float(temperature_init)), device=device))
-    return U, V, log_t
+
+    if relative_bias is None:
+        b = torch.nn.Parameter(torch.zeros(1, 1, device=device))
+    else:
+        b = torch.nn.Parameter(
+            torch.full((1, 1), float(relative_bias), device=device),
+            requires_grad=False,
+        )
+
+    log_t = torch.nn.Parameter(torch.full((1, 1), math.log(float(temperature)), device=device))
+    return U, V, b, log_t
 
 
 def make_optimizer_and_scheduler(params, num_steps: int, lr: float, min_lr_ratio: float, warmup_frac: float):
@@ -302,7 +327,11 @@ def make_optimizer_and_scheduler(params, num_steps: int, lr: float, min_lr_ratio
     if not (0.0 <= warmup_frac < 1.0):
         raise ValueError(f"warmup_frac must lie in [0, 1), got {warmup_frac}.")
 
-    optimizer = torch.optim.Adam(params, lr=lr)
+    trainable_params = [param for param in params if getattr(param, "requires_grad", False)]
+    if not trainable_params:
+        raise ValueError("No trainable parameters were provided to the optimizer.")
+
+    optimizer = torch.optim.Adam(trainable_params, lr=lr)
     warmup_steps = max(1, int(round(num_steps * warmup_frac))) if num_steps > 1 and warmup_frac > 0 else 0
     decay_steps = max(1, num_steps - warmup_steps)
 
@@ -333,39 +362,95 @@ def make_optimizer_and_scheduler(params, num_steps: int, lr: float, min_lr_ratio
     return optimizer, scheduler
 
 
+def auto_row_chunk_size(width: int, target_entries: int = 2_000_000) -> int:
+    return max(1, target_entries // max(1, width))
+
+
+def build_subset_position_lookup(n: int, left_subset_cpu: torch.Tensor) -> torch.Tensor:
+    subset_pos = torch.full((n,), -1, dtype=torch.long)
+    subset_pos[left_subset_cpu] = torch.arange(left_subset_cpu.numel(), dtype=torch.long)
+    return subset_pos
+
+
+def build_chunk_adjacency_from_subset_lookup(
+    neighborhoods_chunk_cpu: torch.Tensor,
+    subset_pos_cpu: torch.Tensor,
+    batch_size: int,
+) -> torch.Tensor:
+    rows, k = neighborhoods_chunk_cpu.shape
+    A_chunk = torch.zeros((rows, batch_size), dtype=torch.bool)
+
+    if rows == 0 or k == 0 or batch_size == 0:
+        return A_chunk
+
+    selected_pos = subset_pos_cpu[neighborhoods_chunk_cpu]
+    valid = selected_pos >= 0
+    if valid.any():
+        row_ids = torch.arange(rows, dtype=torch.long).unsqueeze(1).expand(-1, k)
+        A_chunk[row_ids[valid], selected_pos[valid]] = True
+
+    return A_chunk
+
+
 def current_temperature(log_t: torch.Tensor) -> torch.Tensor:
     return torch.exp(log_t)
-
-
-def infonce_loss(U: torch.Tensor, V: torch.Tensor, neighborhoods_device: torch.Tensor, log_t: torch.Tensor) -> torch.Tensor:
-    temperature = current_temperature(log_t)
-    logits = (U @ V.T) / temperature
-    log_probs = F.log_softmax(logits, dim=1)
-
-    pos_log_probs = log_probs.gather(1, neighborhoods_device)
-    return -pos_log_probs.mean()
 
 
 def train_one_step(
     U: torch.nn.Parameter,
     V: torch.nn.Parameter,
+    b: torch.Tensor,
     log_t: torch.nn.Parameter,
     neighborhoods_cpu: torch.Tensor,
+    batch_size: int,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
 ) -> float:
+    N, k = neighborhoods_cpu.shape
+    n = V.shape[0]
     optimizer.zero_grad(set_to_none=True)
-    neighborhoods_device = neighborhoods_cpu.to(device=device, dtype=torch.long)
-    loss = infonce_loss(U=U, V=V, neighborhoods_device=neighborhoods_device, log_t=log_t)
-    loss.backward()
-    optimizer.step()
 
+    left_subset_cpu = torch.randperm(n)[:batch_size]
+    left_subset = left_subset_cpu.to(device=device)
+    subset_pos_cpu = build_subset_position_lookup(n=n, left_subset_cpu=left_subset_cpu)
+
+    total_pos_in_subset = int((subset_pos_cpu[neighborhoods_cpu] >= 0).sum().item())
+    if total_pos_in_subset == 0:
+        return 0.0
+
+    row_chunk_size = min(N, auto_row_chunk_size(batch_size))
+    total_loss_value = 0.0
+    temperature = current_temperature(log_t)
+
+    for row_start in range(0, N, row_chunk_size):
+        row_end = min(row_start + row_chunk_size, N)
+
+        U_chunk = U[row_start:row_end]
+        V_subset = V.index_select(0, left_subset)
+        scores = U_chunk @ V_subset.T
+        logits = (scores - b) / temperature
+
+        neighborhoods_chunk_cpu = neighborhoods_cpu[row_start:row_end]
+        A_chunk = build_chunk_adjacency_from_subset_lookup(
+            neighborhoods_chunk_cpu=neighborhoods_chunk_cpu,
+            subset_pos_cpu=subset_pos_cpu,
+            batch_size=batch_size,
+        )
+        pos_mask = A_chunk.to(device=device)
+
+        if pos_mask.any():
+            log_probs = F.log_softmax(logits, dim=1)
+            chunk_loss = -log_probs[pos_mask].sum() / float(total_pos_in_subset)
+            chunk_loss.backward()
+            total_loss_value += float(chunk_loss.detach().cpu().item())
+
+    optimizer.step()
     with torch.no_grad():
         renormalize_rows_inplace(U)
         renormalize_rows_inplace(V)
         log_t.clamp_(min=math.log(1e-4), max=math.log(1e2))
 
-    return float(loss.detach().cpu().item())
+    return total_loss_value
 
 
 @torch.no_grad()
@@ -376,29 +461,32 @@ def compute_margin(
     device: torch.device,
 ) -> Tuple[float, float, float]:
     N, k = neighborhoods_cpu.shape
-    scores = U.detach() @ V.detach().T
-    neighborhoods_device = neighborhoods_cpu.to(device=device, dtype=torch.long)
+    n = V.shape[0]
+    row_chunk_size = min(N, auto_row_chunk_size(n, target_entries=4_000_000))
 
-    pos_scores = scores.gather(1, neighborhoods_device)
-    pos_min = float(pos_scores.min().item())
+    pos_min = float("inf")
+    neg_max = float("-inf")
+    V_detached = V.detach()
 
-    masked_scores = scores.clone()
-    masked_scores.scatter_(1, neighborhoods_device, float("-inf"))
-    neg_max = float(masked_scores.max().item())
+    for row_start in range(0, N, row_chunk_size):
+        row_end = min(row_start + row_chunk_size, N)
 
-    margin = 0.5 * (pos_min - neg_max)
+        U_chunk = U[row_start:row_end]
+        scores = U_chunk @ V_detached.T
+        neighborhoods_chunk = neighborhoods_cpu[row_start:row_end].to(device=device)
+
+        pos_scores = scores.gather(1, neighborhoods_chunk)
+        pos_min = min(pos_min, float(pos_scores.min().item()))
+
+        masked_scores = scores.clone()
+        masked_scores.scatter_(1, neighborhoods_chunk, float("-inf"))
+        neg_max = max(neg_max, float(masked_scores.max().item()))
+
+    margin = float("nan")
+    if math.isfinite(pos_min) and math.isfinite(neg_max):
+        margin = 0.5 * (pos_min - neg_max)
+
     return pos_min, neg_max, margin
-
-
-@torch.no_grad()
-def evaluate_top_k_accuracy(U: torch.nn.Parameter, V: torch.nn.Parameter, neighborhoods_cpu: torch.Tensor, k: int) -> float:
-    scores = U.detach() @ V.detach().T
-    topk_idx = torch.topk(scores, k=k, dim=1, largest=True, sorted=False).indices
-
-    topk_sorted = torch.sort(topk_idx, dim=1).values.cpu()
-    true_sorted = torch.sort(neighborhoods_cpu.long(), dim=1).values
-    hits = (topk_sorted == true_sorted).all(dim=1).to(torch.float32)
-    return float(hits.mean().item())
 
 
 def save_npz(path: Path, **kwargs) -> None:
@@ -418,53 +506,41 @@ def save_checkpoint_npz(
     step: int,
     U: torch.nn.Parameter,
     V: torch.nn.Parameter,
+    b: torch.Tensor,
     log_t: torch.nn.Parameter,
     loss_value: float,
     pos_min: float,
     neg_max: float,
     margin: float,
-    accuracy: float,
-    best_accuracy: float,
-    best_loss: float,
     lr: float,
 ) -> None:
-    b_placeholder = np.asarray([[np.nan]], dtype=np.float32)
     t_value = current_temperature(log_t).detach().cpu().numpy().astype(np.float32)
-
     ckpt_path = save_dir / f"checkpoint_step_{step:06d}.npz"
     save_npz(
         ckpt_path,
         step=step,
         U=U,
         V=V,
-        b=b_placeholder,
+        b=b,
         t=t_value,
         loss=loss_value,
         pos_min=pos_min,
         neg_max=neg_max,
         margin=margin,
-        accuracy=accuracy,
-        best_accuracy=best_accuracy,
-        best_loss=best_loss,
         lr=lr,
-        temperature=t_value,
     )
     save_npz(
         save_dir / "latest.npz",
         step=step,
         U=U,
         V=V,
-        b=b_placeholder,
+        b=b,
         t=t_value,
         loss=loss_value,
         pos_min=pos_min,
         neg_max=neg_max,
         margin=margin,
-        accuracy=accuracy,
-        best_accuracy=best_accuracy,
-        best_loss=best_loss,
         lr=lr,
-        temperature=t_value,
     )
 
 
@@ -483,6 +559,7 @@ def train_infonce_bipartite(
     lr: float = 1e-2,
     min_lr_ratio: float = 1e-2,
     warmup_frac: float = 0.05,
+    relative_bias: Optional[float] = None,
     temperature: float = 0.1,
     seed: Optional[int] = None,
     device: Optional[str] = None,
@@ -504,25 +581,30 @@ def train_infonce_bipartite(
             temperature=temperature,
         )
     else:
-        N, batch_size = validate_and_resolve_sizes(
-            n=n,
-            d=d,
-            k=k,
-            p=None,
-            N=N,
-            batch_size=batch_size,
-            temperature=temperature,
-        )
+        if N is None:
+            raise ValueError("When graph_path is provided, you must also provide N.")
+        if batch_size is None:
+            batch_size = n
+        if not (1 <= batch_size <= n):
+            raise ValueError(f"batch_size must satisfy 1 <= batch_size <= n, got {batch_size}.")
+        if not (1 <= k <= n):
+            raise ValueError(f"k must satisfy 1 <= k <= n for InfoNCE, got k={k}, n={n}.")
+        if temperature <= 0:
+            raise ValueError(f"temperature must be positive, got {temperature}.")
 
     save_dir = Path(save_path)
     save_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Using device: {resolved_device}")
     print(f"Resolved sizes: n={n}, N={N}, d={d}, k={k}, batch_size={batch_size}")
+    if relative_bias is None:
+        print("Bias mode: trainable")
+    else:
+        print(f"Bias mode: fixed at relative_bias={relative_bias}")
 
     if graph_path is None:
         print("Sampling distinct k-neighborhoods...")
-        neighborhoods_cpu = sample_neighborhoods(n=n, k=k, N=N).long()
+        neighborhoods_cpu = sample_neighborhoods(n=n, k=k, N=N)
     else:
         print(f"Reading graph from: {graph_path}")
         neighborhoods_cpu = load_graph_neighborhoods(
@@ -530,7 +612,7 @@ def train_infonce_bipartite(
             expected_N=N,
             expected_n=n,
             expected_k=k,
-        ).long()
+        )
 
     config = {
         "graph_path": graph_path,
@@ -539,17 +621,17 @@ def train_infonce_bipartite(
         "k": k,
         "p": p,
         "N": N,
-        "batch_size_requested": batch_size,
-        "batching_mode": "full_batch",
+        "batch_size": batch_size,
         "initialization": initialization,
-        "loss_type": "infonce",
         "num_steps": num_steps,
         "save_every": save_every,
         "save_path": str(save_dir),
         "lr": lr,
         "min_lr_ratio": min_lr_ratio,
         "warmup_frac": warmup_frac,
-        "temperature_init": temperature,
+        "relative_bias": relative_bias,
+        "temperature": temperature,
+        "loss_type": "infonce",
         "seed": seed,
         "device": str(resolved_device),
     }
@@ -567,18 +649,19 @@ def train_infonce_bipartite(
     print(f"Saved graph_data.npz and config.json to {save_dir}")
     print(f"Initializing U and V with '{initialization}' initialization...")
 
-    U, V, log_t = initialize_embeddings(
+    U, V, b, log_t = initialize_embeddings(
         neighborhoods_cpu=neighborhoods_cpu,
         N=N,
         n=n,
         d=d,
         initialization=initialization,
-        temperature_init=temperature,
         device=resolved_device,
+        relative_bias=relative_bias,
+        temperature=temperature,
     )
 
     optimizer, scheduler = make_optimizer_and_scheduler(
-        params=[U, V, log_t],
+        params=[U, V, b, log_t],
         num_steps=num_steps,
         lr=lr,
         min_lr_ratio=min_lr_ratio,
@@ -589,23 +672,19 @@ def train_infonce_bipartite(
     pos_min = float("nan")
     neg_max = float("nan")
     margin = float("nan")
-    accuracy = float("nan")
-    best_accuracy = 0.0
-    best_loss = float("inf")
 
     for step in range(1, num_steps + 1):
         last_loss = train_one_step(
             U=U,
             V=V,
+            b=b,
             log_t=log_t,
             neighborhoods_cpu=neighborhoods_cpu,
+            batch_size=batch_size,
             optimizer=optimizer,
             device=resolved_device,
         )
         scheduler.step()
-
-        if last_loss < best_loss:
-            best_loss = last_loss
 
         should_save = (step % save_every == 0) or (step == num_steps)
         if should_save:
@@ -615,46 +694,35 @@ def train_infonce_bipartite(
                 neighborhoods_cpu=neighborhoods_cpu,
                 device=resolved_device,
             )
-            accuracy = evaluate_top_k_accuracy(U=U, V=V, neighborhoods_cpu=neighborhoods_cpu, k=k)
-            best_accuracy = max(best_accuracy, accuracy)
             current_lr = optimizer.param_groups[0]["lr"]
-            current_t = float(current_temperature(log_t).item())
             print(
                 f"step={step:6d} | loss={last_loss:.6f} | lr={current_lr:.6e} | "
-                f"t={current_t:.6f} | acc={accuracy:.6f} | best_acc={best_accuracy:.6f} | margin={margin:.6f}"
+                f"t={current_temperature(log_t).item():.6f} | b={b.item():.6f} | margin={margin:.6f}"
             )
             save_checkpoint_npz(
                 save_dir=save_dir,
                 step=step,
                 U=U,
                 V=V,
+                b=b,
                 log_t=log_t,
                 loss_value=last_loss,
                 pos_min=pos_min,
                 neg_max=neg_max,
                 margin=margin,
-                accuracy=accuracy,
-                best_accuracy=best_accuracy,
-                best_loss=best_loss,
                 lr=current_lr,
             )
 
-    b_placeholder = np.asarray([[np.nan]], dtype=np.float32)
-    t_value = current_temperature(log_t).detach().cpu().numpy().astype(np.float32)
     save_npz(
         save_dir / "final.npz",
         U=U,
         V=V,
-        b=b_placeholder,
-        t=t_value,
+        b=b,
+        t=current_temperature(log_t).detach().cpu().numpy().astype(np.float32),
         loss=last_loss,
         pos_min=pos_min,
         neg_max=neg_max,
         margin=margin,
-        accuracy=accuracy,
-        best_accuracy=best_accuracy,
-        best_loss=best_loss,
-        temperature=t_value,
     )
     print(f"Training complete. Final artifacts saved under: {save_dir}")
 
@@ -662,6 +730,8 @@ def train_infonce_bipartite(
         "save_dir": str(save_dir),
         "resolved_N": N,
         "resolved_batch_size": batch_size,
+        "relative_bias": relative_bias,
+        "temperature": temperature,
         "device": str(resolved_device),
     }
 
@@ -683,6 +753,7 @@ def main() -> None:
         lr=args.lr,
         min_lr_ratio=args.min_lr_ratio,
         warmup_frac=args.warmup_frac,
+        relative_bias=args.relative_bias,
         temperature=args.temperature,
         seed=args.seed,
         device=args.device,
