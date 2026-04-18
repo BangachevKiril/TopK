@@ -313,8 +313,8 @@ def initialize_embeddings(
             requires_grad=False,
         )
 
-    log_t = torch.nn.Parameter(torch.full((1, 1), math.log(float(temperature)), device=device))
-    return U, V, b, log_t
+    t = torch.nn.Parameter(torch.full((1, 1), float(temperature), device=device))
+    return U, V, b, t
 
 
 def make_optimizer_and_scheduler(params, num_steps: int, lr: float, min_lr_ratio: float, warmup_frac: float):
@@ -392,15 +392,15 @@ def build_chunk_adjacency_from_subset_lookup(
     return A_chunk
 
 
-def current_temperature(log_t: torch.Tensor) -> torch.Tensor:
-    return torch.exp(log_t)
+def current_temperature(t: torch.Tensor) -> torch.Tensor:
+    return t
 
 
 def train_one_step(
     U: torch.nn.Parameter,
     V: torch.nn.Parameter,
     b: torch.Tensor,
-    log_t: torch.nn.Parameter,
+    t: torch.nn.Parameter,
     neighborhoods_cpu: torch.Tensor,
     batch_size: int,
     optimizer: torch.optim.Optimizer,
@@ -420,7 +420,6 @@ def train_one_step(
 
     row_chunk_size = min(N, auto_row_chunk_size(batch_size))
     total_loss_value = 0.0
-    temperature = current_temperature(log_t)
 
     for row_start in range(0, N, row_chunk_size):
         row_end = min(row_start + row_chunk_size, N)
@@ -428,6 +427,7 @@ def train_one_step(
         U_chunk = U[row_start:row_end]
         V_subset = V.index_select(0, left_subset)
         scores = U_chunk @ V_subset.T
+        temperature = current_temperature(t)
         logits = (scores - b) / temperature
 
         neighborhoods_chunk_cpu = neighborhoods_cpu[row_start:row_end]
@@ -448,7 +448,7 @@ def train_one_step(
     with torch.no_grad():
         renormalize_rows_inplace(U)
         renormalize_rows_inplace(V)
-        log_t.clamp_(min=math.log(1e-4), max=math.log(1e2))
+        t.clamp_(min=1e-4, max=1e2)
 
     return total_loss_value
 
@@ -507,14 +507,14 @@ def save_checkpoint_npz(
     U: torch.nn.Parameter,
     V: torch.nn.Parameter,
     b: torch.Tensor,
-    log_t: torch.nn.Parameter,
+    t: torch.nn.Parameter,
     loss_value: float,
     pos_min: float,
     neg_max: float,
     margin: float,
     lr: float,
 ) -> None:
-    t_value = current_temperature(log_t).detach().cpu().numpy().astype(np.float32)
+    t_value = current_temperature(t).detach().cpu().numpy().astype(np.float32)
     ckpt_path = save_dir / f"checkpoint_step_{step:06d}.npz"
     save_npz(
         ckpt_path,
@@ -649,7 +649,7 @@ def train_infonce_bipartite(
     print(f"Saved graph_data.npz and config.json to {save_dir}")
     print(f"Initializing U and V with '{initialization}' initialization...")
 
-    U, V, b, log_t = initialize_embeddings(
+    U, V, b, t = initialize_embeddings(
         neighborhoods_cpu=neighborhoods_cpu,
         N=N,
         n=n,
@@ -661,7 +661,7 @@ def train_infonce_bipartite(
     )
 
     optimizer, scheduler = make_optimizer_and_scheduler(
-        params=[U, V, b, log_t],
+        params=[U, V, b, t],
         num_steps=num_steps,
         lr=lr,
         min_lr_ratio=min_lr_ratio,
@@ -678,7 +678,7 @@ def train_infonce_bipartite(
             U=U,
             V=V,
             b=b,
-            log_t=log_t,
+            t=t,
             neighborhoods_cpu=neighborhoods_cpu,
             batch_size=batch_size,
             optimizer=optimizer,
@@ -697,7 +697,7 @@ def train_infonce_bipartite(
             current_lr = optimizer.param_groups[0]["lr"]
             print(
                 f"step={step:6d} | loss={last_loss:.6f} | lr={current_lr:.6e} | "
-                f"t={current_temperature(log_t).item():.6f} | b={b.item():.6f} | margin={margin:.6f}"
+                f"t={current_temperature(t).item():.6f} | b={b.item():.6f} | margin={margin:.6f}"
             )
             save_checkpoint_npz(
                 save_dir=save_dir,
@@ -705,7 +705,7 @@ def train_infonce_bipartite(
                 U=U,
                 V=V,
                 b=b,
-                log_t=log_t,
+                t=t,
                 loss_value=last_loss,
                 pos_min=pos_min,
                 neg_max=neg_max,
@@ -718,7 +718,7 @@ def train_infonce_bipartite(
         U=U,
         V=V,
         b=b,
-        t=current_temperature(log_t).detach().cpu().numpy().astype(np.float32),
+        t=current_temperature(t).detach().cpu().numpy().astype(np.float32),
         loss=last_loss,
         pos_min=pos_min,
         neg_max=neg_max,
