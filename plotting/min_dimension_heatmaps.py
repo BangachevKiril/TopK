@@ -6,6 +6,7 @@ import json
 import math
 import re
 import warnings
+import zipfile
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_FLOOR, getcontext
 from pathlib import Path
@@ -175,34 +176,66 @@ def load_reference_metadata(run_root: Path) -> Tuple[int, int, int, int]:
 
 
 
-def checkpoint_files_for_run_dir(run_dir: Path) -> List[Path]:
-    ckpts = sorted(run_dir.glob("checkpoint_step_*.npz"))
-    if ckpts:
-        return ckpts
+def checkpoint_files_for_run_dir(run_dir: Path) -> Tuple[List[Path], List[Path]]:
+    checkpoint_steps = sorted(run_dir.glob("checkpoint_step_*.npz"))
     fallback: List[Path] = []
     for name in ("latest.npz", "final.npz"):
         path = run_dir / name
         if path.is_file():
             fallback.append(path)
-    return fallback
+    return checkpoint_steps, fallback
+
+
+
+def _load_margin_rows(paths: Sequence[Path]) -> Tuple[List[Tuple[float, float]], List[str]]:
+    rows: List[Tuple[float, float]] = []
+    errors: List[str] = []
+
+    for path in paths:
+        try:
+            if not path.is_file():
+                continue
+            if path.stat().st_size == 0:
+                raise ValueError("empty file")
+            with np.load(path, allow_pickle=False) as data:
+                if "margin" not in data:
+                    raise KeyError("missing 'margin' entry")
+                step = float(np.asarray(data["step"]).item()) if "step" in data else math.nan
+                margin = float(np.asarray(data["margin"]).item())
+        except Exception as exc:
+            errors.append(f"{path.name}: {exc}")
+            continue
+        rows.append((step, margin))
+
+    rows.sort(key=lambda x: (math.inf if math.isnan(x[0]) else x[0]))
+    return rows, errors
 
 
 
 def load_margin_history(run_dir: Path) -> np.ndarray:
-    ckpts = checkpoint_files_for_run_dir(run_dir)
-    if not ckpts:
+    checkpoint_steps, fallback = checkpoint_files_for_run_dir(run_dir)
+    errors: List[str] = []
+
+    rows, step_errors = _load_margin_rows(checkpoint_steps)
+    errors.extend(step_errors)
+
+    if not rows:
+        fb_rows, fb_errors = _load_margin_rows(fallback)
+        rows.extend(fb_rows)
+        errors.extend(fb_errors)
+
+    if not rows:
+        if checkpoint_steps or fallback:
+            joined = "; ".join(errors) if errors else "all candidate files were unreadable"
+            raise HeatmapDataError(f"No readable checkpoint files found in {run_dir} ({joined})")
         raise HeatmapDataError(f"No checkpoint files found in {run_dir}")
 
-    rows: List[Tuple[float, float]] = []
-    for path in ckpts:
-        with np.load(path, allow_pickle=False) as data:
-            if "margin" not in data:
-                raise HeatmapDataError(f"File {path} is missing the 'margin' entry")
-            step = float(np.asarray(data["step"]).item()) if "step" in data else math.nan
-            margin = float(np.asarray(data["margin"]).item())
-        rows.append((step, margin))
+    if errors:
+        warnings.warn(
+            f"Ignoring unreadable checkpoint files in {run_dir}: " + "; ".join(errors),
+            stacklevel=2,
+        )
 
-    rows.sort(key=lambda x: (math.inf if math.isnan(x[0]) else x[0]))
     return np.asarray([margin for _, margin in rows], dtype=float)
 
 
@@ -228,18 +261,36 @@ def summarize_run_root(run_root: Path, success_mode: str, min_margin: float) -> 
         raise HeatmapDataError(f"No d_<dim> folders found under {run_root}")
 
     successful_dims: List[int] = []
+    readable_dims: List[int] = []
+    skipped_dims: List[int] = []
+
     for d in dims:
         run_dir = run_root / f"d_{d}"
         if not run_dir.is_dir():
             continue
         try:
             margins = load_margin_history(run_dir)
-        except HeatmapDataError:
-            raise
+        except HeatmapDataError as exc:
+            skipped_dims.append(d)
+            warnings.warn(f"Skipping unreadable dimension d={d} under {run_root}: {exc}", stacklevel=2)
+            continue
         except Exception as exc:
-            raise HeatmapDataError(f"Failed while reading {run_dir}: {exc}") from exc
+            skipped_dims.append(d)
+            warnings.warn(f"Skipping unreadable dimension d={d} under {run_root}: {exc}", stacklevel=2)
+            continue
+
+        readable_dims.append(d)
         if dimension_success(margins=margins, success_mode=success_mode, min_margin=min_margin):
             successful_dims.append(d)
+
+    if not readable_dims:
+        warnings.warn(f"No readable dimension folders found under {run_root}", stacklevel=2)
+
+    if skipped_dims:
+        warnings.warn(
+            f"Skipped unreadable dimensions under {run_root}: {sorted(skipped_dims)}",
+            stacklevel=2,
+        )
 
     min_success_d = min(successful_dims) if successful_dims else None
     return RunRootSummary(
@@ -249,8 +300,20 @@ def summarize_run_root(run_root: Path, success_mode: str, min_margin: float) -> 
         N=N,
         seed=seed,
         min_success_d=min_success_d,
-        available_dims=tuple(dims),
+        available_dims=tuple(readable_dims if readable_dims else dims),
     )
+
+
+
+def _root_preference(path: Path, root: Path) -> Tuple[int, int, str]:
+    try:
+        rel = path.resolve().relative_to(root.resolve())
+        parts = rel.parts
+    except Exception:
+        parts = path.resolve().parts
+        rel = path.resolve()
+    repeated_neighbors = sum(1 for a, b in zip(parts, parts[1:]) if a == b)
+    return (len(parts), repeated_neighbors, str(rel))
 
 
 
@@ -274,8 +337,10 @@ def build_model_index(root: Path, success_mode: str, min_margin: float) -> Dict[
                 choose_current = curr_d is not None
             elif curr_d is None:
                 choose_current = False
-            else:
+            elif curr_d != prev_d:
                 choose_current = curr_d < prev_d
+            else:
+                choose_current = _root_preference(summary.root, root) < _root_preference(prev.root, root)
             if choose_current:
                 index[key] = summary
         else:
@@ -286,7 +351,7 @@ def build_model_index(root: Path, success_mode: str, min_margin: float) -> Dict[
         for key, roots in sorted(duplicates.items()):
             pieces.append(f"{key}: " + ", ".join(str(r) for r in roots))
         warnings.warn(
-            "Found duplicate run roots for the same (n,k,N,seed). Keeping the easiest successful one.\n" + "\n".join(pieces),
+            "Found duplicate run roots for the same (n,k,N,seed). Keeping the preferred one.\n" + "\n".join(pieces),
             stacklevel=2,
         )
 
@@ -413,7 +478,6 @@ def seed_description(seed_reduce: str) -> str:
 
 def write_p_figure(
     p_raw: str,
-    p_decimal: Decimal,
     output_pdf: Path,
     sigmoid_table: np.ndarray,
     infonce_table: np.ndarray,
@@ -439,7 +503,7 @@ def write_p_figure(
     masked_infonce = np.ma.masked_invalid(infonce_table)
 
     im_left = left_ax.imshow(masked_sigmoid, cmap=cmap, norm=norm, aspect="auto")
-    im_right = right_ax.imshow(masked_infonce, cmap=cmap, norm=norm, aspect="auto")
+    right_ax.imshow(masked_infonce, cmap=cmap, norm=norm, aspect="auto")
 
     for ax, title in zip(axes, ["Sigmoid loss", "InfoNCE loss"]):
         ax.set_title(title)
@@ -530,14 +594,13 @@ def main() -> int:
     )
 
     written: List[Path] = []
-    for p_raw, p_decimal in p_pairs:
+    for p_raw, _p_decimal in p_pairs:
         if p_raw not in tables_by_p:
             continue
         sigmoid_table, infonce_table, ns, ks = tables_by_p[p_raw]
         output_pdf = output_root / f"min_success_dim_compare_p_{safe_p_string(p_raw)}.pdf"
         maybe = write_p_figure(
             p_raw=p_raw,
-            p_decimal=p_decimal,
             output_pdf=output_pdf,
             sigmoid_table=sigmoid_table,
             infonce_table=infonce_table,

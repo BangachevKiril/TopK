@@ -13,8 +13,8 @@
 # minimal dimension d such that N=floor(p * binom(n,k)) achieved
 # positive margin.
 #
-# Usage:
-#   bash plot_min_success_dim_heatmaps_bash.sh \
+# You can either edit the *_RAW variables below directly, or pass:
+#   bash min_dimension_heatmaps_bash.sh \
 #       /path/to/sigmoid_root \
 #       /path/to/infonce_root \
 #       "0.1,0.25,0.5" \
@@ -30,10 +30,20 @@
 #   OVERWRITE     0 or 1            default: 0
 # ============================================================
 
-SIGMOID_ROOT_RAW="/home/kirilb/orcd/scratch/TopK/SyntheticEmbeddingsSmall/sigmoid_random_initialization"
-INFONCE_ROOT_RAW="/home/kirilb/orcd/scratch/TopK/SyntheticEmbeddingsSmall/infonce_random_initialization"
-P_VALUES_RAW=(0.015625 0.03125 0.0625 0.125 0.25 0.5 1.0)
-PLOT_ROOT_RAW="/home/kirilb/orcd/scratch/TopK/SyntheticEmbeddingsSmall/min_success_dim_heatmaps"
+DEFAULT_SIGMOID_ROOT_RAW="/home/kirilb/orcd/scratch/TopK/SyntheticEmbeddingsSmall/sigmoid_random_initialization/b_rel_0"
+DEFAULT_INFONCE_ROOT_RAW="/home/kirilb/orcd/scratch/TopK/SyntheticEmbeddingsSmall/infonce_random_initialization/b_rel_0"
+DEFAULT_P_VALUES_RAW=(0.015625 0.03125 0.0625 0.125 0.25 0.5 1.0)
+DEFAULT_PLOT_ROOT_RAW="/home/kirilb/orcd/scratch/TopK/SyntheticEmbeddingsSmall/min_success_dim_heatmaps"
+
+SIGMOID_ROOT_RAW="${1:-$DEFAULT_SIGMOID_ROOT_RAW}"
+INFONCE_ROOT_RAW="${2:-$DEFAULT_INFONCE_ROOT_RAW}"
+PLOT_ROOT_RAW="${4:-$DEFAULT_PLOT_ROOT_RAW}"
+
+if [ $# -ge 3 ] && [ -n "$3" ]; then
+    IFS=',' read -r -a P_VALUES_RAW <<< "$3"
+else
+    P_VALUES_RAW=("${DEFAULT_P_VALUES_RAW[@]}")
+fi
 
 SUCCESS_MODE="${SUCCESS_MODE:-best}"
 SEED_REDUCE="${SEED_REDUCE:-any}"
@@ -56,8 +66,8 @@ if [ ! -d "$INFONCE_ROOT_RAW" ]; then
     exit 1
 fi
 
-if [ -z "$P_VALUES_RAW" ]; then
-    echo "P_VALUES is empty."
+if [ "${#P_VALUES_RAW[@]}" -eq 0 ]; then
+    echo "P_VALUES_RAW is empty."
     exit 1
 fi
 
@@ -85,11 +95,12 @@ SIGMOID_ROOT="$(cd "$SIGMOID_ROOT_RAW" && pwd -P)"
 INFONCE_ROOT="$(cd "$INFONCE_ROOT_RAW" && pwd -P)"
 mkdir -p "$PLOT_ROOT_RAW"
 PLOT_ROOT="$(cd "$PLOT_ROOT_RAW" && pwd -P)"
+P_VALUES_CSV="$(IFS=,; echo "${P_VALUES_RAW[*]}")"
 
 if [ -z "${SLURM_JOB_ID:-}" ]; then
     echo "SIGMOID_ROOT=$SIGMOID_ROOT"
     echo "INFONCE_ROOT=$INFONCE_ROOT"
-    echo "P_VALUES_RAW=$P_VALUES_RAW"
+    echo "P_VALUES_CSV=$P_VALUES_CSV"
     echo "PLOT_ROOT=$PLOT_ROOT"
     echo "SUCCESS_MODE=$SUCCESS_MODE"
     echo "SEED_REDUCE=$SEED_REDUCE"
@@ -101,7 +112,7 @@ if [ -z "${SLURM_JOB_ID:-}" ]; then
     echo "Submitting one plotting job."
 
     sbatch \
-        --export=ALL,SIGMOID_ROOT="$SIGMOID_ROOT",INFONCE_ROOT="$INFONCE_ROOT",P_VALUES_RAW="$P_VALUES_RAW",PLOT_ROOT="$PLOT_ROOT",SUCCESS_MODE="$SUCCESS_MODE",SEED_REDUCE="$SEED_REDUCE",MIN_MARGIN="$MIN_MARGIN",FIGWIDTH="$FIGWIDTH",FIGHEIGHT="$FIGHEIGHT",ANNOTATE="$ANNOTATE",OVERWRITE="$OVERWRITE" \
+        --export=ALL,SIGMOID_ROOT="$SIGMOID_ROOT",INFONCE_ROOT="$INFONCE_ROOT",P_VALUES_CSV="$P_VALUES_CSV",PLOT_ROOT="$PLOT_ROOT",SUCCESS_MODE="$SUCCESS_MODE",SEED_REDUCE="$SEED_REDUCE",MIN_MARGIN="$MIN_MARGIN",FIGWIDTH="$FIGWIDTH",FIGHEIGHT="$FIGHEIGHT",ANNOTATE="$ANNOTATE",OVERWRITE="$OVERWRITE" \
         "$0"
     exit $?
 fi
@@ -111,17 +122,21 @@ CONDA_BASE="$(conda info --base)"
 source "$CONDA_BASE/etc/profile.d/conda.sh"
 conda activate GPUenv
 
+if [ -n "${SLURM_SUBMIT_DIR:-}" ]; then
+    SCRIPT_DIR="$SLURM_SUBMIT_DIR"
+else
+    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+fi
 PYTHON_SCRIPT="min_dimension_heatmaps.py"
 
 if [ ! -f "$PYTHON_SCRIPT" ]; then
     echo "Python script not found: $PYTHON_SCRIPT"
-    echo "Place min_dimension_heatmaps.py in the same directory from which you call sbatch."
     exit 1
 fi
 
-IFS=',' read -r -a P_VALUES_ARR <<< "$P_VALUES_RAW"
+IFS=',' read -r -a P_VALUES_ARR <<< "${P_VALUES_CSV:-}"
 if [ "${#P_VALUES_ARR[@]}" -eq 0 ]; then
-    echo "Failed to parse any p values from: $P_VALUES_RAW"
+    echo "Failed to parse any p values from: ${P_VALUES_CSV:-}"
     exit 1
 fi
 
@@ -157,7 +172,7 @@ echo "SLURM_JOB_ID=${SLURM_JOB_ID}"
 echo "SIGMOID_ROOT=$SIGMOID_ROOT"
 echo "INFONCE_ROOT=$INFONCE_ROOT"
 echo "PLOT_ROOT=$PLOT_ROOT"
-echo "P_VALUES_RAW=$P_VALUES_RAW"
+echo "P_VALUES_CSV=$P_VALUES_CSV"
 printf 'Running command:\n'
 printf ' %q' "${cmd[@]}"
 printf '\n'
