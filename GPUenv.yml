@@ -1,0 +1,30 @@
+name: GPUenv
+channels:
+  - conda-forge
+dependencies:
+  - python=3.9
+  - pytorch
+  - pytorch-cuda=11.8
+  - torchaudio
+  - torchvision
+  - scipy
+  - huggingface_hub
+  - click
+  - joblib
+  - transformers
+  - tiktoken
+  - blobfile
+  - wordfreq
+  - protobuf
+  - scikit-learn
+  - einops
+  - pytest
+  - sentence-transformers
+  - rapidfuzz
+  - tabulate
+  - mamba
+  - tikzplotlib
+  - jupyterlab
+  - openpyxl
+  - cvxpy
+prefix: /home/kirilb/.conda/envs/GPUenv
