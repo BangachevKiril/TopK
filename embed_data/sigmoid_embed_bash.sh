@@ -4,35 +4,31 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=64G
-#SBATCH --time=05:59:00
+#SBATCH --time=23:59:00
 #SBATCH -o logs/%x_%A_%a.out
 #SBATCH -e logs/%x_%A_%a.err
 
 # ============================================================
-# Recursively embed all saved synthetic graphs under GRAPH_ROOT.
+# Recursively embed saved synthetic graphs under GRAPH_ROOT,
+# but only for graph families matching the requested n, k, p lists.
 #
 # Usage:
-#   bash sigmoid_embed_bash.sh /path/to/graph_root /path/to/out_root [relative_bias]
+#   bash sigmoid_embed_bash.sh GRAPH_ROOT OUT_ROOT P_VALUES K_VALUES N_VALUES [RELATIVE_BIAS]
 #
-# Optional:
-#   relative_bias
-#     If provided, passes --relative_bias to the Python script,
-#     which fixes the bias to that constant and does not optimize it.
-#
-# This version:
-#   1) does NOT use manifests,
-#   2) recursively scans GRAPH_ROOT for graph_n_*_k_*_N_*_seed_*.npz
-#      (and legacy .npy if no .npz twin exists),
-#   3) parses n, k, N, seed from the filename,
-#   4) mirrors the same relative subfolder structure under OUT_ROOT,
-#   5) launches exactly one Slurm array task per graph,
-#   6) each array task loops over all d values exactly once.
+# Notes:
+#   - Graph filenames contain n, k, N, seed but not p.
+#   - To filter by p, this script reconstructs the allowed N values using
+#       N = floor(p * choose(n, k))
+#     exactly as in the graph genseration scripts.
 # ============================================================
 
 # ------------------------
 # Embedding dimensions
 # ------------------------
-d_values=(2 3 4 5 6 7 8 9 10 11 12 13 14 25 50 100)
+d_values=(5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30)
+p_values=(1.0)
+n_values=(20 40 60 80 100 120 140 160 180 200 220 240)
+k_values=(2)
 
 # ------------------------
 # Training settings
@@ -45,20 +41,105 @@ LR=0.01
 MIN_LR_RATIO=0.01
 WARMUP_FRAC=0.05
 DEVICE=""
-RELATIVE_BIAS=0
+RELATIVE_BIAS="0"
 
 MAX_CONCURRENT=20
 
-GRAPH_ROOT="${1:-${GRAPH_ROOT:-/home/kirilb/orcd/scratch/TopK/SyntheticGraphsSmall}}"
-BASE_OUT_ROOT="${2:-${OUT_ROOT:-/home/kirilb/orcd/scratch/TopK/SyntheticEmbeddingsSmall/sigmoid_${INITIALIZATION}_initialization}}"
+GRAPH_ROOT="/home/kirilb/orcd/scratch/TopK_data/SyntheticGraphs"
+BASE_OUT_ROOT="/home/kirilb/orcd/scratch/TopK_data/SyntheticEmbeddings/sigmoid_${INITIALIZATION}_initialization"
 OUT_ROOT="${BASE_OUT_ROOT}"
 if [ "${RELATIVE_BIAS+x}" = x ]; then
     OUT_ROOT="${BASE_OUT_ROOT}/b_rel_${RELATIVE_BIAS}"
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+P_VALUES_RAW="${p_values[*]}"
+K_VALUES_RAW="${k_values[*]}"
+N_VALUES_RAW="${n_values[*]}"
+
 SCRIPT_PATH="$(readlink -f "$0")"
-PYTHON_SCRIPT="sigmoid_embed.py"
+
+choose() {
+    local n=$1
+    local k=$2
+    if [ "$k" -lt 0 ] || [ "$k" -gt "$n" ]; then
+        echo 0
+        return
+    fi
+    if [ "$k" -gt $((n - k)) ]; then
+        k=$((n - k))
+    fi
+    local result=1
+    local i term
+    for ((i=1; i<=k; i++)); do
+        term=$(( n - k + i ))
+        result=$(( result * term / i ))
+    done
+    echo "$result"
+}
+
+compute_N_from_p() {
+    local n=$1
+    local k=$2
+    local p=$3
+    local max_neighborhoods
+    max_neighborhoods=$(choose "$n" "$k")
+
+    awk -v p="$p" -v M="$max_neighborhoods" 'BEGIN { printf "%d\n", int(p * M) }'
+}
+
+parse_list_to_array() {
+    local raw="$1"
+    local arr_name="$2"
+    local normalized
+    local -a parsed
+    local -n out_arr="$arr_name"
+
+    normalized="${raw//,/ }"
+    read -r -a parsed <<< "$normalized"
+
+    if [ "${#parsed[@]}" -eq 0 ]; then
+        echo "Missing required list argument for ${arr_name}." >&2
+        return 1
+    fi
+
+    out_arr=("${parsed[@]}")
+}
+
+contains_value() {
+    local needle="$1"
+    shift
+    local item
+    for item in "$@"; do
+        if [ "$item" = "$needle" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+triplet_is_requested() {
+    local n="$1"
+    local k="$2"
+    local N="$3"
+    local p computed_N
+
+    if ! contains_value "$n" "${FILTER_N_VALUES[@]}"; then
+        return 1
+    fi
+
+    if ! contains_value "$k" "${FILTER_K_VALUES[@]}"; then
+        return 1
+    fi
+
+    for p in "${FILTER_P_VALUES[@]}"; do
+        computed_N=$(compute_N_from_p "$n" "$k" "$p")
+        if [ "$computed_N" = "$N" ]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
 
 list_graphs_unique() {
     local graph_root="$1"
@@ -87,6 +168,20 @@ parse_graph_metadata() {
     return 1
 }
 
+list_filtered_graphs() {
+    local graph_root="$1"
+    local graph_path metadata n k N seed
+
+    while IFS= read -r graph_path; do
+        metadata="$(parse_graph_metadata "$graph_path")" || continue
+        read -r n k N seed <<< "$metadata"
+
+        if triplet_is_requested "$n" "$k" "$N"; then
+            echo "$graph_path"
+        fi
+    done < <(list_graphs_unique "$graph_root" | sort)
+}
+
 build_run_dir() {
     local graph_path="$1"
     local d="$2"
@@ -108,33 +203,54 @@ build_run_dir() {
     fi
 }
 
+parse_list_to_array "$P_VALUES_RAW" FILTER_P_VALUES
+parse_list_to_array "$K_VALUES_RAW" FILTER_K_VALUES
+parse_list_to_array "$N_VALUES_RAW" FILTER_N_VALUES
+
 mkdir -p logs
 mkdir -p "${OUT_ROOT}"
 
-mapfile -t GRAPH_PATHS < <(list_graphs_unique "${GRAPH_ROOT}" | sort)
+mapfile -t ALL_GRAPH_PATHS < <(list_graphs_unique "${GRAPH_ROOT}" | sort)
+mapfile -t GRAPH_PATHS < <(list_filtered_graphs "${GRAPH_ROOT}" | sort)
 
+TOTAL_FOUND=${#ALL_GRAPH_PATHS[@]}
 TOTAL_GRAPHS=${#GRAPH_PATHS[@]}
 NUM_D_VALUES=${#d_values[@]}
 TOTAL_RUNS=$((TOTAL_GRAPHS * NUM_D_VALUES))
 
-if [ "${TOTAL_GRAPHS}" -eq 0 ]; then
+if [ "${TOTAL_FOUND}" -eq 0 ]; then
     echo "No graph files found under: ${GRAPH_ROOT}"
-    echo "Expected filenames like:"
-    echo "  graph_n_<n>_k_<k>_N_<N>_seed_<seed>.npz"
-    echo "or legacy .npy versions."
+    echo "Expected filenames like graph_n_<n>_k_<k>_N_<N>_seed_<seed>.npz"
+    exit 1
+fi
+
+if [ "${TOTAL_GRAPHS}" -eq 0 ]; then
+    echo "Found ${TOTAL_FOUND} graph file(s), but none matched the requested n, k, p filters."
+    echo "Requested p values: ${FILTER_P_VALUES[*]}"
+    echo "Requested k values: ${FILTER_K_VALUES[*]}"
+    echo "Requested n values: ${FILTER_N_VALUES[*]}"
+    echo "First few graph files actually found:"
+    for graph_path in "${ALL_GRAPH_PATHS[@]:0:10}"; do
+        echo "  ${graph_path}"
+    done
+    echo "Recall: filtering by p is done via N = floor(p * choose(n, k))."
     exit 1
 fi
 
 if [ -z "${SLURM_ARRAY_TASK_ID:-}" ]; then
     echo "SCRIPT_PATH=${SCRIPT_PATH}"
-    echo "PYTHON_SCRIPT=${PYTHON_SCRIPT}"
+    echo "PYTHON_SCRIPT=sigmoid_embed.py"
     echo "GRAPH_ROOT=${GRAPH_ROOT}"
     echo "OUT_ROOT=${OUT_ROOT}"
+    echo "P_VALUES=${FILTER_P_VALUES[*]}"
+    echo "K_VALUES=${FILTER_K_VALUES[*]}"
+    echo "N_VALUES=${FILTER_N_VALUES[*]}"
     if [ -n "${RELATIVE_BIAS}" ]; then
         echo "RELATIVE_BIAS=${RELATIVE_BIAS} (fixed)"
     else
         echo "RELATIVE_BIAS=<trainable bias>"
     fi
+    echo "TOTAL_FOUND=${TOTAL_FOUND}"
     echo "TOTAL_GRAPHS=${TOTAL_GRAPHS}"
     echo "NUM_D_VALUES=${NUM_D_VALUES}"
     echo "TOTAL_RUNS=${TOTAL_RUNS}"
@@ -142,7 +258,7 @@ if [ -z "${SLURM_ARRAY_TASK_ID:-}" ]; then
 
     sbatch \
         --array=0-$((TOTAL_GRAPHS - 1))%${MAX_CONCURRENT} \
-        --export=ALL,GRAPH_ROOT="${GRAPH_ROOT}",OUT_ROOT="${OUT_ROOT}",RELATIVE_BIAS="${RELATIVE_BIAS}" \
+        --export=ALL,GRAPH_ROOT="${GRAPH_ROOT}",OUT_ROOT="${OUT_ROOT}",RELATIVE_BIAS="${RELATIVE_BIAS}",P_VALUES_RAW="${P_VALUES_RAW}",K_VALUES_RAW="${K_VALUES_RAW}",N_VALUES_RAW="${N_VALUES_RAW}" \
         "${SCRIPT_PATH}"
     exit $?
 fi
@@ -151,11 +267,6 @@ module load miniforge
 CONDA_BASE="$(conda info --base)"
 source "${CONDA_BASE}/etc/profile.d/conda.sh"
 conda activate GPUenv
-
-if [ ! -f "${PYTHON_SCRIPT}" ]; then
-    echo "Python script not found: ${PYTHON_SCRIPT}"
-    exit 1
-fi
 
 graph_idx=${SLURM_ARRAY_TASK_ID}
 
@@ -177,6 +288,9 @@ echo "SLURM_JOB_ID=${SLURM_JOB_ID}"
 echo "SLURM_ARRAY_TASK_ID=${SLURM_ARRAY_TASK_ID}"
 echo "GRAPH_ROOT=${GRAPH_ROOT}"
 echo "OUT_ROOT=${OUT_ROOT}"
+echo "P_VALUES=${FILTER_P_VALUES[*]}"
+echo "K_VALUES=${FILTER_K_VALUES[*]}"
+echo "N_VALUES=${FILTER_N_VALUES[*]}"
 if [ -n "${RELATIVE_BIAS}" ]; then
     echo "RELATIVE_BIAS=${RELATIVE_BIAS} (fixed)"
 else
@@ -197,7 +311,7 @@ for d in "${d_values[@]}"; do
     echo "save_path=${run_dir}"
 
     cmd=(
-        python "${PYTHON_SCRIPT}"
+        python "sigmoid_embed.py"
         --graph_path "${graph_path}"
         --n "${n}"
         --N "${N}"

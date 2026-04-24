@@ -5,18 +5,18 @@
 #SBATCH --time=04:00:00
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=32G
-#SBATCH --partition=mit_normal
+#SBATCH --partition=mit_preemptable
 
-n_values=(10 20 40 80 160 320 640)
-p_values=(0.015625 0.03125 0.0625 0.125 0.25 0.5 1.0)
-k_values=(1 2 3 4 5)
+n_values=(20 40 60 80 100 120 140 160 180 200 220 240)
+p_values=(1.0)
+k_values=(2 3)
 seed_values=(0)
 
 NUM_ARRAY_JOBS=20
 MAX_CONCURRENT=20
 NN_THRESHOLD=100000000
 
-OUTPUT_DIR="/home/kirilb/orcd/scratch/TopK/SyntheticGraphsSmall"
+OUTPUT_DIR="/home/kirilb/orcd/scratch/TopK_data/SyntheticGraphs"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT_PATH="$(readlink -f "$0")"
